@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -10,6 +11,7 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -157,131 +159,72 @@ _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 # the whole gate.
 _PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
 
-# Characters that may legally continue a URL, per RFC 3986: unreserved,
-# sub-delims, and the path/query/fragment separators. Used as an ALLOWLIST —
-# see `_url_quoted` for why the previous denylist could not be completed.
-# Lower-case only: every comparison is against an already-lowered response.
-_URL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/?#%")
-# What a SENTENCE, not a URL, leaves after a link — plus the trailing slash the
-# needle has already had stripped from its own end. A run made only of these
-# means the URL ENDED there; any other character continues it.
-_TAIL_IGNORABLE = frozenset("/.,;:!?)'\"")
-# Characters that can appear in a HOSTNAME. A match preceded by one sits inside
-# a DIFFERENT host — `cdn.example.com/a` is not a citation of `example.com/a`.
-_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
+def _coverage_identity(url: str) -> str | None:
+    """Return the URL identity used by the citation-coverage gate.
+
+    Scheme and a single leading ``www.`` label are presentation variants. Host
+    case is insensitive. Everything else is identity-bearing: userinfo, port,
+    path, query, and fragment are preserved exactly, apart from trailing slashes.
+    Returning ``None`` keeps malformed authority-free URLs uncovered.
+    """
+    candidate = url if _SCHEME_RE.match(url) else f"//{url}"
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+
+    hostname = hostname.lower().removeprefix("www.")
+    raw_authority = parsed.netloc
+    userinfo = raw_authority.rsplit("@", 1)[0] + "@" if "@" in raw_authority else ""
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = userinfo + rendered_host
+    if port is not None:
+        authority += f":{port}"
+
+    identity = authority + parsed.path.rstrip("/")
+    if parsed.query:
+        identity += f"?{parsed.query}"
+    if parsed.fragment:
+        identity += f"#{parsed.fragment}"
+    return identity
+
+
+def _coverage_url_label(url: str) -> str:
+    """Return a stable diagnostic id without copying URL credentials."""
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    return f"url#{digest}"
 
 
 def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
-    """Return the input URLs the response never quotes.
+    """Return input URLs not cited as complete parsed URL identities.
 
-    :func:`_has_url_failures` only catches give-up LANGUAGE — a model that
-    silently omits a URL emits none, so omission was undetectable by
-    construction (the silent-drop hazard). This closes that hole with ONE rule:
-    every input URL must APPEAR in the response, scheme- and www-insensitively,
-    and must not merely be the prefix of a longer URL.
-
-    An earlier revision inferred coverage from prose instead — path segments,
-    distinctive tokens, domain aliases, stoplists. It was removed rather than
-    repaired, for two measured reasons. MEASURED over the completed-evaluation
-    corpus (85 items / 146 URLs readable, 2026-09-10): the ladder passed 64/146
-    where this rule alone passes 58/146, so roughly 200 lines of heuristic bought
-    SIX URLs — one of them a template placeholder that should never have demanded
-    coverage. And it carried six defects (Codex, PR #1820), every one of which
-    let a URL nobody had discussed pass as covered and be permanently baselined.
-
-    Repair was not possible at the token level: no rule separates ``voxcpm``
-    (identity) from ``second`` (prose) — six letters each, no digit, no
-    separator, in no stoplist — because the information is not in the token. It
-    is in whether the response CITED the URL, which is exactly what this rule
-    asks.
-
-    A miss is deliberately cheap: the caller re-queues the item through the
-    existing bounded partial-failure retry path. It never deletes data.
+    The response is first reduced to the URLs recognized by the canonical inbox
+    scanner. Comparing parsed identities makes prefixes, sibling hosts, Unicode
+    continuations, and legal URL delimiters different URLs by construction. It
+    also avoids the prior substring matcher's growing boundary rules and keeps
+    the scan linear in the number of extracted URLs.
     """
     urls = _extract_urls(input_content)
     if not urls:
         return []
-    lower = response_text.lower()
-
-    def _bare(u: str) -> str:
-        return _SCHEME_RE.sub("", u.lower()).removeprefix("www.")
-
-    def _url_quoted(bare_url: str) -> bool:
-        """The URL appears and does NOT continue into a longer one.
-
-        The continuation test is an ALLOWLIST of what may legally follow. It was
-        a denylist of URL characters, and a denylist of a character class is
-        always incomplete: it omitted ``:``, ``;``, ``@``, ``+``, ``~``, ``!``,
-        ``$``, ``,``, ``*``, ``'``, ``(`` and ``)``, all legal in an RFC 3986
-        path — so a response quoting only ``.../foo:bar`` vouched for an omitted
-        ``.../foo``. Patching in the three that were reported would have left the
-        other nine for the next review round.
-
-        Inverted here: a character that a SENTENCE would not have put there
-        continues the URL. That closes the whole class, and also stops a
-        sentence-final ``.`` or ``,`` from breaking an otherwise exact match —
-        which the denylist got wrong in the other direction.
-
-        BOTH boundaries are checked, and they are not symmetric. The needle is
-        scheme- and ``www.``-stripped, so it is deliberately a SUFFIX of what a
-        response actually writes — which means the left side cannot simply
-        mirror the right. Without a left check, a response citing a DIFFERENT
-        host whose name merely ends in the input host vouched for it:
-        ``cdn.example.com/a`` and ``notexample.com/a`` both covered
-        ``example.com/a`` (MEASURED against this function, 2026-09-10).
-        """
-        if not bare_url:
-            # ``https:///`` normalises to an empty needle, and an empty pattern
-            # matches at every position — so every response "covered" it.
-            # Nothing can be evidence for a URL carrying no identity. Note this
-            # URL is therefore never satisfiable: under `enforce` it retries to
-            # the cap and parks, which is the correct end for a URL that carries
-            # no identity to check.
-            return False
-        for m in re.finditer(re.escape(bare_url), lower):
-            # LEFT: allow the stripped ``www.``, a scheme's ``//``, and any
-            # non-host character. Reject a host character — that is a different
-            # hostname, not a citation of this one.
-            #
-            # Read the ONE character before the match; never slice the prefix.
-            # `lower[:m.start()]` copies m.start() characters on EVERY match, so
-            # with many matches it is quadratic in the response length — the
-            # identical defect this loop's right-hand side was just fixed for,
-            # reintroduced on the left. MEASURED with the slice: 1.62 s on a
-            # 384 KB response; without it, 0.011 s. `str.endswith` takes bounds
-            # and copies nothing.
-            start = m.start()
-            if start and lower[start - 1] in _HOST_CHARS and not lower.endswith("www.", 0, start):
-                continue
-            # RIGHT: stop at the FIRST character a sentence would not leave,
-            # rather than consuming the whole run. That is exact — the question
-            # was only ever "does any non-punctuation character follow?" — and
-            # it is what keeps this loop linear. Consuming the run made the scan
-            # QUADRATIC in the match count: MEASURED 0.335 s on a 77 KB response
-            # of concatenated repeats, quadrupling on every doubling, which would
-            # stall the server's event loop. Shadow mode does NOT mitigate that,
-            # because a shadow gate still computes its verdict.
-            j, n = m.end(), len(lower)
-            continues = False
-            while j < n and lower[j] in _URL_CHARS:
-                if lower[j] not in _TAIL_IGNORABLE:
-                    continues = True
-                    break
-                j += 1
-            if not continues:
-                return True
-        return False
-
-    uncovered: list[str] = []
-    for u in urls:
-        if _PLACEHOLDER_RE.search(u):
-            # A real template placeholder (api.github.com/repos/{slug}) is not a
-            # fetchable URL — never demand coverage.
-            continue
-        if _url_quoted(_bare(u).rstrip("/")):
-            continue
-        uncovered.append(u)
-    return uncovered
+    response_identities = {
+        identity
+        for cited in _extract_urls(response_text)
+        if (identity := _coverage_identity(cited)) is not None
+    }
+    return [
+        url
+        for url in urls
+        if not _PLACEHOLDER_RE.search(url)
+        and (
+            (identity := _coverage_identity(url)) is None
+            or identity not in response_identities
+        )
+    ]
 
 
 _ACKNOWLEDGED_RE = re.compile(
@@ -501,6 +444,7 @@ class InboxMonitor:
         """Core check logic, called under _check_lock.
 
         Decomposed into phase methods for readability:
+        0. _phase_recover_pending — re-derive work interrupted by a prior crash
         1. _phase_resume — process approval-parked items
         2. _phase_detect_changes — scan for new/modified files
         3. _phase_create_records — create DB rows for changed files
@@ -518,6 +462,11 @@ class InboxMonitor:
 
         now = self._clock()
         now_iso = now.isoformat()
+
+        # Phase 0: recover batches made durable before a prior process exited.
+        # This must precede detection: stale rows are retired so they no longer
+        # suppress the current file version in get_all_known().
+        await self._phase_recover_pending(now_iso)
 
         # Phase 1: Resume approval-parked items
         resume_items, _resumed_ids, resumed_paths = await self._phase_resume(
@@ -590,6 +539,33 @@ class InboxMonitor:
             batches_dispatched=batches_dispatched,
             errors=errors,
         )
+
+    # =================================================================
+    # Phase 0: Recover rows made durable before dispatch
+    # =================================================================
+
+    async def _phase_recover_pending(self, now_iso: str) -> int:
+        """Return pre-dispatch rows to retry so complete work is re-derived.
+
+        ``_queue_drop`` commits batches individually. A process exit can leave
+        either a complete undispatched drop or only a prefix of one, and the row
+        set has no durable expected-count field that distinguishes them. Never
+        dispatch that unknowable set. Atomically mark all pending rows retriable;
+        detection plus the existing delta retry lane rebuilds the complete
+        outstanding content from the source file and completed baseline.
+        """
+        from genesis.db.crud import inbox_items
+
+        recovered = await inbox_items.requeue_pending_after_restart(
+            self._db,
+            processed_at=now_iso,
+        )
+        if recovered:
+            logger.info(
+                "Returned %d pre-dispatch inbox batch(es) to restart recovery",
+                recovered,
+            )
+        return recovered
 
     # =================================================================
     # Phase 1: Resume approval-parked items
@@ -1121,23 +1097,6 @@ class InboxMonitor:
                             now - last_dt,
                         )
                         continue
-            # Past the gate (or empty delta): supersede a stale pending drop so
-            # a fresh modification replaces an undispatched one — and an orphaned
-            # pending row from an interrupted scan is cleaned up (shared across
-            # both the empty-delta and new-content paths).
-            existing = await inbox_items.get_by_file_path(self._db, str(f))
-            if existing and existing["status"] == "pending":
-                # Supersession is not a failure of the item — preserve the
-                # retry budget (the default failed-path increment would walk
-                # repeatedly-edited files toward max_retries exclusion and
-                # block row recycling near the cap).
-                await inbox_items.update_status(
-                    self._db,
-                    existing["id"],
-                    status="failed",
-                    error_message="superseded_by_modification",
-                    retry_count=existing["retry_count"],
-                )
             # Likewise supersede rows PARKED on a pending approval for this
             # file: the fresh delta below is a superset of the parked one (the
             # baseline advances only on completed rows), and the new drop
@@ -1257,12 +1216,34 @@ class InboxMonitor:
                     reason="source file deleted",
                 )
                 continue
+            except IsADirectoryError:
+                logger.info(
+                    "Retry candidate %s is no longer a file; abandoning its stale rows",
+                    f,
+                )
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db,
+                    str(f),
+                    max_retries=self._config.max_retries,
+                    reason="source path is not a file",
+                )
+                continue
             except PermissionError:
                 # Possibly transient (e.g. locked mid-write) — skip WITHOUT
                 # abandoning; a later scan's read may succeed.
                 logger.warning(
                     "Permission error reading retry candidate %s; skipping",
                     f,
+                )
+                continue
+            except OSError as exc:
+                # Other filesystem failures may be transient (I/O errors,
+                # interrupted network mounts). Contain the tick without
+                # abandoning the work; the failed row remains a retry candidate.
+                logger.warning(
+                    "I/O error reading retry candidate %s; will retry: %s",
+                    f,
+                    exc,
                 )
                 continue
             if not content.strip():
@@ -1328,9 +1309,11 @@ class InboxMonitor:
         ``items_per_eval``, and create one pending row per batch under a shared
         ``drop_id``. Appends one InboxItem per batch to ``pending_items``.
 
-        Each batch's lines are stored verbatim in ``batch_items`` so the resume
-        pass re-dispatches the exact delta (not a full-file re-read) and a
-        restart mid-drop can reconstruct the not-yet-completed batches.
+        Each batch's lines are stored verbatim in ``batch_items`` so the
+        approval-resume pass re-dispatches the exact approved delta rather than
+        re-reading the full file. Pre-dispatch restart recovery deliberately
+        does not trust this row set: creation can crash after any row commit, so
+        it re-derives complete outstanding work from source plus baseline.
         """
         from genesis.db.crud import inbox_items
 
@@ -1956,9 +1939,10 @@ class InboxMonitor:
         # permanent invisible loss.
         uncovered = _uncovered_urls(output_text, item.content)
         if uncovered:
-            # Bound the stored message: whole URLs, first 5, with an explicit
-            # count for the rest (a pasted mega-drop must not balloon the row).
-            shown = ", ".join(uncovered[:5])
+            # Stable opaque ids keep presigned query values and URL userinfo out
+            # of the journal and inbox_items.error_message while leaving each
+            # miss correlatable across retries. Bound the stored message too.
+            shown = ", ".join(_coverage_url_label(url) for url in uncovered[:5])
             if len(uncovered) > 5:
                 shown += f" (+{len(uncovered) - 5} more)"
             if self._config.url_coverage_mode != "enforce":
@@ -1994,17 +1978,8 @@ class InboxMonitor:
                     await self._session_manager.complete(session_id)
                 return False
 
-        # Success: baseline ONLY this batch's lines.
-        await self._complete_batch_baseline(
-            item,
-            completed_at,
-            response_path=response_path,
-        )
-        if session_id is not None:
-            await self._session_manager.complete(session_id)
-
-        # Follow-ups + build lane fire only for evaluations that actually
-        # COMPLETED — a coverage-failed eval retries, and acting on it here
+        # Follow-ups + build lane fire only for evaluations that passed their
+        # gates — a coverage-failed eval retries, and acting on it here
         # would create rows from an evaluation we just declared unevaluated
         # (dedup would then block the retry's corrected verdict).
         if output_text:
@@ -2049,6 +2024,18 @@ class InboxMonitor:
                         "Build-lane eval handling failed (non-fatal)",
                         exc_info=True,
                     )
+
+        # Success: baseline ONLY this batch's lines, after its synchronous
+        # durable side effects. A cancellation or process exit before this point
+        # leaves the row non-completed so recovery can retry the missing writes.
+        await self._complete_batch_baseline(
+            item,
+            completed_at,
+            response_path=response_path,
+        )
+        if session_id is not None:
+            await self._session_manager.complete(session_id)
+
         await self._notify_batch(
             message_queue,
             item,

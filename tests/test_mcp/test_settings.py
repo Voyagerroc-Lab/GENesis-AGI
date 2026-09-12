@@ -432,6 +432,14 @@ class TestValidateInboxMonitor:
         errs = _validate_inbox_monitor({"inbox_monitor": {"effort": "insane"}})
         assert len(errs) == 1
 
+    @pytest.mark.parametrize("key", ["model", "effort", "url_coverage_mode"])
+    @pytest.mark.parametrize("value", [[], {}, ["shadow"], {"mode": "shadow"}])
+    def test_enum_fields_reject_non_scalar_json_without_raising(self, key, value):
+        errs = _validate_inbox_monitor({"inbox_monitor": {key: value}})
+
+        assert len(errs) == 1
+        assert key in errs[0]
+
     def test_timezone_ignored(self):
         """Timezone field is no longer validated — uses system timezone."""
         errs = _validate_inbox_monitor({"inbox_monitor": {"timezone": "Fake/Zone"}})

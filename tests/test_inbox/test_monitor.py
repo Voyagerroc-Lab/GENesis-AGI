@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiosqlite
 import pytest
@@ -170,7 +171,10 @@ async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, d
     from genesis.db.crud import inbox_items
 
     f = inbox_dir / "links.md"
-    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    f.write_text(
+        "https://alice:password@example.com/one-thing?token=secret-one "
+        "https://other.org/two-thing?sig=secret-two"
+    )
     mock_invoker.run.return_value = _success_output(
         "# Inbox Evaluation\n\n## one-thing\n"
         "Thorough discussion of the example.com piece and nothing else.\n" + "x" * 300
@@ -181,7 +185,10 @@ async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, d
     row = await inbox_items.get_by_file_path(db, str(f))
     assert row["status"] == "failed"
     assert row["error_message"].startswith("partial_url_failure")
-    assert "other.org/two-thing" in row["error_message"]
+    assert "url#" in row["error_message"]
+    assert "password" not in row["error_message"]
+    assert "secret-one" not in row["error_message"]
+    assert "secret-two" not in row["error_message"]
     assert row["evaluated_content"] is None
     assert row["retry_count"] == 1
 
@@ -204,7 +211,7 @@ async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, moc
     assert monitor._config.url_coverage_mode == "shadow", "the shipped default must be shadow"
 
     f = inbox_dir / "links.md"
-    f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    f.write_text("https://example.com/one-thing?token=shadow-secret")
     mock_invoker.run.return_value = _success_output(
         "# Inbox Evaluation\n\n## one-thing\n"
         "Thorough discussion of the example.com piece and nothing else.\n" + "x" * 300
@@ -216,6 +223,8 @@ async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, moc
     assert any("url-coverage SHADOW" in r.getMessage() for r in caplog.records), (
         "shadow mode must say what it WOULD have done"
     )
+    assert "shadow-secret" not in caplog.text
+    assert "url#" in caplog.text
     row = await inbox_items.get_by_file_path(db, str(f))
     assert row["status"] == "completed"  # acted on nothing
     assert row["evaluated_content"] is not None
@@ -295,6 +304,40 @@ async def test_fully_covered_urls_complete_normally(monitor, inbox_dir, db, mock
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled_sink", ["follow_ups", "build_lane"])
+async def test_cancellation_during_synchronous_side_effects_does_not_baseline(
+    monitor,
+    inbox_dir,
+    db,
+    mock_invoker,
+    mock_session_manager,
+    monkeypatch,
+    cancelled_sink,
+):
+    """A process exit during durable side effects must leave the item retriable."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one-thing")
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n**Source:** https://example.com/one-thing\n" + "x" * 300
+    )
+    cancelled = AsyncMock(side_effect=asyncio.CancelledError)
+    if cancelled_sink == "follow_ups":
+        monkeypatch.setattr(monitor, "_create_follow_ups_from_eval", cancelled)
+    else:
+        monitor._build_lane = SimpleNamespace(handle_eval=cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(f))
+    assert row["status"] != "completed"
+    assert row["evaluated_content"] is None
+    mock_session_manager.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_supersede_does_not_burn_a_retry(monitor, inbox_dir, db):
     """A superseded pending row keeps its retry_count.
 
@@ -363,6 +406,324 @@ async def test_supersede_near_retry_cap_still_recycles(monitor, inbox_dir, db):
     assert len(rows) == 1, [dict(r) for r in rows]
     assert rows[0]["status"] == "completed"
     assert rows[0]["retry_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_modified_file_supersedes_every_stale_pending_batch(
+    monitor, inbox_dir, db
+):
+    """A multi-item interrupted drop must not leave invisible pending siblings."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    for index in range(2):
+        await inbox_items.create(
+            db,
+            id=f"stale-{index}",
+            file_path=str(f),
+            content_hash="0" * 64,
+            status="pending",
+            created_at=f"2026-01-01T00:00:0{index}+00:00",
+            drop_id="old-drop",
+        )
+
+    await monitor.check_once()
+
+    rows = await db.execute_fetchall(
+        "SELECT status FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    assert rows
+    assert all(row["status"] != "pending" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_modified_vanished_file_retires_stale_pending_batches(
+    monitor, inbox_dir, db, monkeypatch
+):
+    """A vanished replacement must not strand its old batches."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/new")
+    await inbox_items.create(
+        db,
+        id="stale",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        "genesis.inbox.monitor.read_content",
+        Mock(side_effect=FileNotFoundError),
+    )
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_id(db, "stale")
+    assert row["status"] == "failed"
+    assert row["error_message"] == "pending_restart_requeue"
+
+
+@pytest.mark.asyncio
+async def test_temporarily_unreadable_pending_batch_recovers_when_readable(
+    monitor, inbox_dir, db, monkeypatch, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+    from genesis.inbox import monitor as monitor_module
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    content = "https://example.com/article"
+    f.write_text(content)
+    await inbox_items.create(
+        db,
+        id="pending",
+        file_path=str(f),
+        content_hash=compute_hash(f),
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+        drop_id="drop",
+        batch_items=content,
+    )
+    original_read = monitor_module.read_content
+    monkeypatch.setattr(
+        "genesis.inbox.monitor.read_content",
+        Mock(side_effect=PermissionError),
+    )
+
+    await monitor.check_once()
+    assert (await inbox_items.get_by_id(db, "pending"))["status"] == "failed"
+    mock_invoker.run.assert_not_awaited()
+
+    monkeypatch.setattr("genesis.inbox.monitor.read_content", original_read)
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, "pending"))["status"] == "completed"
+    mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_abandons_path_replaced_by_directory(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+
+    replacement = inbox_dir / "was-a-file.md"
+    replacement.mkdir()
+    await inbox_items.create(
+        db,
+        id="pending",
+        file_path=str(replacement),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+        drop_id="drop",
+        batch_items="https://example.com/article",
+    )
+
+    await monitor.check_once()
+    row = await inbox_items.get_by_id(db, "pending")
+
+    assert row["status"] == "failed"
+    assert row["error_message"] == (
+        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source path is not a file"
+    )
+    await monitor.check_once()
+    mock_invoker.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_modified_file_retires_stale_pending_batches(monitor, inbox_dir, db):
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("")
+    await inbox_items.create(
+        db,
+        id="stale",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, "stale"))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_deferred_modification_retires_stale_pending_batches(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/new")
+    await inbox_items.create(
+        db,
+        id="completed",
+        file_path=str(f),
+        content_hash="1" * 64,
+        status="completed",
+        created_at="2026-03-10T11:59:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "completed",
+        status="completed",
+        processed_at="2026-03-10T12:00:00+00:00",
+        evaluated_content="https://example.com/old",
+    )
+    await inbox_items.create(
+        db,
+        id="stale",
+        file_path=str(f),
+        content_hash="0" * 64,
+        status="pending",
+        created_at="2026-03-10T12:01:00+00:00",
+    )
+
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, "stale"))["status"] == "failed"
+    mock_invoker.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_batches_resume_after_crash_before_dispatch(
+    monitor, inbox_dir, db, monkeypatch, mock_invoker
+):
+    """Durable batch payload is the startup authority after a phase-boundary crash."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/article")
+    dispatch = monitor._phase_dispatch_batches
+    monkeypatch.setattr(
+        monitor,
+        "_phase_dispatch_batches",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await monitor.check_once()
+    pending = await inbox_items.query_pending(db)
+    assert len(pending) == 1
+
+    monkeypatch.setattr(monitor, "_phase_dispatch_batches", dispatch)
+    await monitor.check_once()
+
+    assert (await inbox_items.get_by_id(db, pending[0]["id"]))["status"] == "completed"
+    mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_drop_creation_crash_rebuilds_every_item(
+    monitor, inbox_dir, db, monkeypatch, mock_invoker
+):
+    """A durable prefix must never masquerade as a complete multi-batch drop."""
+    from genesis.db.crud import inbox_items
+
+    f = inbox_dir / "links.md"
+    urls = [f"https://example.com/item-{index}" for index in range(3)]
+    f.write_text("\n".join(urls))
+    original_create = inbox_items.create
+    pending_creates = 0
+
+    async def crash_after_first_pending(*args, **kwargs):
+        nonlocal pending_creates
+        result = await original_create(*args, **kwargs)
+        if kwargs.get("status") == "pending":
+            pending_creates += 1
+            if pending_creates == 1:
+                raise asyncio.CancelledError
+        return result
+
+    monkeypatch.setattr(inbox_items, "create", crash_after_first_pending)
+    with pytest.raises(asyncio.CancelledError):
+        await monitor.check_once()
+    assert len(await inbox_items.query_pending(db)) == 1
+
+    monkeypatch.setattr(inbox_items, "create", original_create)
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 3
+    assert mock_invoker.run.await_count == 3
+    baseline = await inbox_items.get_evaluated_content(db, str(f))
+    assert baseline is not None
+    assert all(url in baseline for url in urls)
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_restores_every_batch_in_a_drop(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/one\nhttps://example.com/two")
+    content_hash = compute_hash(f)
+    for index, url in enumerate(
+        ("https://example.com/one", "https://example.com/two")
+    ):
+        await inbox_items.create(
+            db,
+            id=f"pending-{index}",
+            file_path=str(f),
+            content_hash=content_hash,
+            status="pending",
+            created_at=f"2026-01-01T00:00:0{index}+00:00",
+            drop_id="drop",
+            batch_items=url,
+        )
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 2
+    assert mock_invoker.run.await_count == 2
+    statuses = [
+        (await inbox_items.get_by_id(db, f"pending-{index}"))["status"]
+        for index in range(2)
+    ]
+    assert statuses == ["completed", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_rebuilds_a_missing_durable_payload(
+    monitor, inbox_dir, db, mock_invoker
+):
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    f.write_text("https://example.com/current")
+    await inbox_items.create(
+        db,
+        id="malformed",
+        file_path=str(f),
+        content_hash=compute_hash(f),
+        status="pending",
+        created_at="2026-01-01T00:00:00+00:00",
+        drop_id="drop",
+        batch_items="",
+        retry_count=2,
+    )
+
+    result = await monitor.check_once()
+
+    rebuilt = await inbox_items.get_by_id(db, "malformed")
+    assert rebuilt["status"] == "completed"
+    assert rebuilt["batch_items"] == "https://example.com/current"
+    assert rebuilt["drop_id"] != "drop"
+    assert rebuilt["retry_count"] == 2
+    assert result.items_new == 1
+    assert result.batches_dispatched == 1
+    mock_invoker.run.assert_awaited_once()
 
 
 @pytest.mark.asyncio

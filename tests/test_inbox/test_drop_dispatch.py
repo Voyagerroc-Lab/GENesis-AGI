@@ -30,10 +30,9 @@ class _FakeClock:
 
 
 def _ok(
-    # Default fake response passes the per-URL coverage gate for fixtures in
-    # this file: "zzcoverzz" matches every _urls() slug, and the domain words
-    # cover single-URL custom fixtures. Dispatch mechanics are under test
-    # here — coverage-gate behavior is pinned in test_monitor/test_url_failures.
+    # Dispatch mechanics are under test here and this fixture uses the shipped
+    # shadow mode, where a coverage miss is observed but does not block. Exact
+    # parsed-identity behavior is pinned in test_monitor/test_url_failures.
     text: str = (
         "# Inbox Evaluation\n\nlinkedin example.com evaluation "
         "result body zzcoverzz"
@@ -98,8 +97,7 @@ def _monitor(db, inbox_dir, invoker, sm, tmp_path, *, items_per_eval=3):
 
 
 def _urls(n: int) -> str:
-    # Slugs share the distinctive "zzcoverzz" token so _ok()'s default
-    # response counts as covering every one of them (see _ok above).
+    # Distinct URLs exercise batching without relying on prose-token coverage.
     return "\n".join(f"https://example.com/a{i}-zzcoverzz" for i in range(n))
 
 

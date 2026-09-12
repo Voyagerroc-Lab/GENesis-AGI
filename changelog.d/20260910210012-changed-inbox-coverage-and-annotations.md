@@ -3,11 +3,14 @@
   give-up *language* ("could not be fetched"); a response that simply never
   mentioned one of its URLs passed, and the omitted link was permanently
   absorbed into the evaluated baseline — invisible, unrecoverable loss. A
-  coverage check now requires every input URL to APPEAR in the response
-  (scheme- and `www.`-insensitively), and the evaluation prompt requires each
-  URL echoed as a `**Source:**` line. It ships in **shadow**
+  coverage check now requires every scanner-recognized input URL's complete
+  parsed identity to APPEAR in the response. Scheme and host case plus one leading `www.` are
+  presentation variants; userinfo, port, path, query, and fragment remain
+  identity-bearing. The evaluation prompt requires each URL echoed as a
+  `**Source:**` line. It ships in **shadow**
   (`url_coverage_mode: shadow` in `config/inbox_monitor.yaml`): it computes its
-  verdict and logs what it *would* have re-queued, and changes nothing. Set
+  verdict and logs opaque stable ids for what it *would* have re-queued (never
+  raw signed URLs or credentials), and changes nothing. Set
   `url_coverage_mode: enforce` to have a miss re-queue the item through the
   existing bounded retry path with the partial response preserved.
 
@@ -39,5 +42,14 @@
   depth for fewer sessions.
 
 - **Editing an inbox file before its previous snapshot was evaluated no longer
-  burns a retry.** Supersession is bookkeeping, not a failure; repeatedly
-  edited files no longer walk toward the permanent-failure cap.
+  burns a retry or strands sibling batches.** Startup recovery atomically
+  returns every pre-dispatch row to the bounded retry lane without incrementing
+  its retry count. Complete outstanding work is rebuilt from the current file
+  and completed baseline, including a never-created tail when a crash interrupted
+  multi-batch row creation.
+
+- **An inbox evaluation is not baselined before its synchronous durable side
+  effects finish.** Follow-up and build-lane writes still treat ordinary local
+  errors as non-fatal, but cancellation or process exit leaves the batch
+  non-completed and recoverable instead of permanently hiding a missing side
+  effect behind a completed baseline.

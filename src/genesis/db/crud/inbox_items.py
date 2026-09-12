@@ -661,6 +661,28 @@ async def query_pending(db: aiosqlite.Connection, *, limit: int = 50) -> list[di
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def requeue_pending_after_restart(
+    db: aiosqlite.Connection, *, processed_at: str
+) -> int:
+    """Atomically return every pre-dispatch row to the retry lane.
+
+    A crash can interrupt ``_queue_drop`` between per-row commits, so the set of
+    durable pending rows cannot prove that a multi-batch drop is complete. Mark
+    the entire state class retriable in one statement; the monitor then derives
+    complete outstanding work from the current file and completed baseline.
+    Retry counts are preserved because restart recovery is not an eval failure.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = 'failed', error_message = 'pending_restart_requeue',
+               processed_at = ?
+           WHERE status = 'pending'""",
+        (processed_at,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def query_by_batch(db: aiosqlite.Connection, batch_id: str) -> list[dict]:
     cursor = await db.execute(
         "SELECT * FROM inbox_items WHERE batch_id = ? ORDER BY created_at ASC",

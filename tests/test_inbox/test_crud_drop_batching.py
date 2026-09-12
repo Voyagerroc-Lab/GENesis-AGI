@@ -54,6 +54,32 @@ async def test_update_status_for_drop_only_touches_pending_processing(db):
 
 
 @pytest.mark.asyncio
+async def test_restart_requeue_atomically_covers_every_pending_row(db):
+    for index in range(55):
+        await _mk(
+            db,
+            id=f"pending-{index:02d}",
+            drop_id=f"drop-{index:02d}",
+            created_at=f"2026-06-30T00:{index:02d}:00+00:00",
+        )
+    await inbox_items.update_status(db, "pending-54", status="pending", retry_count=2)
+
+    count = await inbox_items.requeue_pending_after_restart(
+        db,
+        processed_at="2026-06-30T01:00:00+00:00",
+    )
+    rows = await db.execute_fetchall(
+        "SELECT status, retry_count, error_message FROM inbox_items ORDER BY id"
+    )
+
+    assert count == 55
+    assert len(rows) == 55
+    assert all(row["status"] == "failed" for row in rows)
+    assert all(row["error_message"] == "pending_restart_requeue" for row in rows)
+    assert rows[-1]["retry_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_get_awaiting_approval_includes_drop_and_batch_items(db):
     await _mk(db, id="a", drop_id="D1", status="processing",
               batch_items="https://x.com/1", created_at="2026-06-30T00:00:01+00:00")

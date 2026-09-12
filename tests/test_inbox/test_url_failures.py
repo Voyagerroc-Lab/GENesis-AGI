@@ -121,10 +121,23 @@ class TestUncoveredUrls:
         )
         assert _uncovered_urls(response, content) == []
 
-    def test_coverage_is_case_insensitive(self):
+    def test_scheme_and_host_are_case_insensitive(self):
         content = "https://github.com/OpenBMB/VoxCPM"
-        response = "# Inbox Evaluation\n**Source:** https://GITHUB.com/openbmb/voxcpm"
+        response = "# Inbox Evaluation\n**Source:** HTTP://GITHUB.COM/OpenBMB/VoxCPM"
         assert _uncovered_urls(response, content) == []
+
+    @pytest.mark.parametrize(
+        "cited",
+        [
+            "https://youtube.com/watch?v=aab1",
+            "https://youtube.com/WATCH?v=AaB1",
+            "https://youtube.com/watch?v=AaB1#section",
+        ],
+    )
+    def test_path_query_and_fragment_identity_remain_case_sensitive_and_exact(self, cited):
+        content = "https://youtube.com/watch?v=AaB1"
+
+        assert _uncovered_urls(f"**Source:** {cited}", content) == [content]
 
     def test_a_sentence_period_after_the_url_does_not_break_the_match(self):
         content = "https://example.com/piece"
@@ -148,26 +161,27 @@ class TestUncoveredUrls:
         response = "# Inbox Evaluation\n**Source:** https://search.app/XYZW"
         assert _uncovered_urls(response, content) == [content]
 
-    def test_a_different_host_ending_in_the_input_host_does_not_vouch(self):
-        """The LEFT boundary, and it is not symmetric with the right one.
+    def test_a_unicode_longer_sibling_does_not_vouch_for_its_prefix(self):
+        content = "https://example.com/foo"
+        response = "# Inbox Evaluation\n**Source:** https://example.com/fooé"
 
-        The needle is scheme- and `www.`-stripped, so it is deliberately a
-        SUFFIX of what a response writes — which is why the left side cannot
-        mirror the right. With no left check at all, a citation of a DIFFERENT
-        host whose name merely ends in the input host covered it.
-        """
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_a_different_host_ending_in_the_input_host_does_not_vouch(self):
+        """Parsed authority comparison must not accept a hostname suffix."""
         content = "https://example.com/article"
         for other in (
             "https://cdn.example.com/article",  # a subdomain is a different host
             "https://notexample.com/article",  # no dot, still a different host
+            "https://notwww.example.com/article",  # text ending in www is not optional www
+            "https://cdn.www.example.com/article",  # nested www is still a subdomain
             "https://my-example.com/article",
         ):
             response = f"# Inbox Evaluation\n**Source:** {other}"
             assert _uncovered_urls(response, content) == [content], f"leaked via {other}"
 
     def test_the_www_and_scheme_variants_still_count_as_the_same_url(self):
-        """The other side of the left boundary: these MUST still pass, and they
-        are exactly why it cannot be a plain word-boundary check."""
+        """Only the explicitly declared presentation variants are normalized."""
         content = "https://example.com/article"
         for same in (
             "https://www.example.com/article",  # `www.` was stripped from the needle
@@ -176,12 +190,6 @@ class TestUncoveredUrls:
         ):
             response = f"# Inbox Evaluation\n{same}"
             assert _uncovered_urls(response, content) == [], f"false miss on {same}"
-
-    # Both boundary checks must cost O(1) per match, not O(response). There are
-    # TWO independent quadratics here and they need DIFFERENT input shapes to
-    # reach — a single test cannot pin both, which is how the first version of
-    # this passed against both defects. A shadow gate still COMPUTES its verdict,
-    # so `url_coverage_mode` mitigates neither: either would stall the event loop.
 
     @staticmethod
     def _scaling_ratio(build, content, k_small, k_large):
@@ -210,33 +218,16 @@ class TestUncoveredUrls:
 
         return best(k_large) / max(best(k_small), 1e-6)
 
-    def test_the_continuation_scan_stops_at_the_first_non_punctuation(self):
-        """Reaches the RIGHT-hand scan: separating repeats with `/` keeps every
-        match's left boundary legal, so each one runs the continuation scan.
-
-        MEASURED at k=2000 (50KB): consuming the whole run takes 7.3s, breaking
-        early takes 0.002s. Asserted as a ratio — see `_scaling_ratio`.
-        """
+    def test_parsed_identity_matching_scales_linearly(self):
+        """A shadow gate still computes coverage, so response size must scale linearly."""
         content = "https://example.com/some-article"
-        # The trailing "more" matters: without it the FINAL occurrence ends at
-        # end-of-string with only a slash after it, which IS a genuine citation,
-        # so the URL would be covered and no match would run the full scan.
         ratio = self._scaling_ratio(
-            lambda k: "example.com/some-article/" * k + "more", content, 1000, 4000
+            lambda k: " ".join(f"https://other{i}.example/item" for i in range(k)),
+            content,
+            1000,
+            4000,
         )
-        assert ratio < 8, f"continuation scan is not O(1) per match: 4x input cost {ratio:.1f}x"
-
-    def test_the_left_boundary_check_never_slices_the_prefix(self):
-        """Reaches the LEFT-hand check: joining repeats with no separator makes
-        every match illegal on the left, so each is rejected there before the
-        right-hand scan ever runs.
-
-        `lower[:m.start()]` copies the prefix on EVERY match. MEASURED at k=32000
-        (768KB): slicing ~1.8s, reading one character 0.017s.
-        """
-        content = "https://example.com/some-article"
-        ratio = self._scaling_ratio(lambda k: "example.com/some-article" * k, content, 8000, 32000)
-        assert ratio < 8, f"left-boundary check is not O(1) per match: 4x input cost {ratio:.1f}x"
+        assert ratio < 8, f"parsed identity scan is not linear: 4x input cost {ratio:.1f}x"
 
     def test_a_malformed_url_never_becomes_a_universal_match(self):
         """Codex #1820 P2: `https:///` normalises to an empty needle, and an
@@ -570,7 +561,7 @@ class TestCountUrlFailures:
 
     async def test_counts_coverage_variant_messages(self, db):
         """The storm guard must also count coverage-gate failures — their
-        error_message carries the uncovered URLs after the base prefix."""
+        error_message carries opaque URL ids after the base prefix."""
         from genesis.db.crud import inbox_items
 
         now = datetime.now(UTC)
@@ -584,7 +575,7 @@ class TestCountUrlFailures:
         )
         await db.execute(
             "UPDATE inbox_items SET error_message = "
-            "'partial_url_failure: uncovered https://x.com/a' "
+            "'partial_url_failure: uncovered url#0123456789ab' "
             "WHERE content_hash = 'h-cov'",
         )
         await db.commit()
