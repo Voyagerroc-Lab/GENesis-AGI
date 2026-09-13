@@ -14,7 +14,10 @@
   unnamed acknowledgment.
 
   The check that decides whether a question really offers the remedies is a
-  bijection: that question's options are the remedy set, one each, nothing else.
+  single-select bijection: that question's options are the remedy set, one each,
+  nothing else. Each option must use the exact declared label or machine key;
+  substring mentions, negations, compound labels, and multi-select menus do not
+  prove that the gate's decision was presented.
   Three counting rules were defeated before it, each narrower than the last, and
   the reason is structural — the relaying agent writes the option text, so no
   count over those words closes the gap. The last of them still passed the case
@@ -29,5 +32,10 @@
   not support the claim, since the check never read which option you actually
   chose.
 
-  A decision records the session that owes it, so one session's outstanding
-  question is never put to, or closed by, another.
+  Live decisions are stored independently with the session and target worktree
+  that owe them. This preserves concurrent sessions and lets a demand created by
+  `git -C <worktree> commit` reach AskUserQuestion in the session's original cwd,
+  without leaking ownerless legacy state across worktrees. Clean confirmation
+  retires an obsolete escalation demand; choosing `shelve` records the answer
+  but does not authorize the commit; and terminal plus escalation decisions must
+  be presented and acknowledged in sequence.

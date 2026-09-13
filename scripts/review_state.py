@@ -53,6 +53,7 @@ external marks.)
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -759,6 +760,7 @@ def get_review_round(cwd: str | None = None) -> int:
 
 def _write_round(state: dict, cwd: str | None = None) -> None:
     """Persist the round-counter state (best-effort — never raises)."""
+    tmp: Path | None = None
     try:
         rf = _round_file(cwd)
         rf.parent.mkdir(parents=True, exist_ok=True)
@@ -771,10 +773,46 @@ def _write_round(state: dict, cwd: str | None = None) -> None:
         tmp.write_text(json.dumps(state, indent=2))
         os.replace(tmp, rf)
     except OSError:
-        pass
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
 
-_CARRIED_FIELDS = ("gate_demand",)
+_CARRIED_FIELDS = ("gate_demand", "gate_demands")
+
+
+def _demands(state: dict | None) -> list[dict]:
+    """Normalized demand records, including the legacy single-slot shape."""
+    if not isinstance(state, dict):
+        return []
+    rows = [dict(d) for d in state.get("gate_demands", []) if isinstance(d, dict)]
+    legacy = state.get("gate_demand")
+    if isinstance(legacy, dict) and legacy not in rows:
+        rows.append(dict(legacy))
+    return rows
+
+
+def _retire_demands(
+    state: dict, *, gate: str | None, choice: str, session_id: str | None = None
+) -> dict:
+    """Retire matching live demands while preserving their audit records."""
+    now = time.time()
+    rows = _demands(state)
+    changed = False
+    for demand in rows:
+        owner_matches = session_id is None or demand.get("session_id") in (None, session_id)
+        if (
+            (gate is None or demand.get("gate") == gate)
+            and demand.get("satisfied_with") is None
+            and owner_matches
+        ):
+            demand["satisfied_with"] = choice
+            demand["satisfied_at"] = now
+            changed = True
+    if changed:
+        state["gate_demands"] = rows
+        state["gate_demand"] = rows[-1]
+    return state
 
 
 def _carry(prev: dict | None, branch: str) -> dict:
@@ -846,22 +884,21 @@ def bump_review_round(
         # alternates clean and defect-bearing rounds has still consumed every one
         # of them, and resetting here would hand it an unbounded budget by simply
         # converging occasionally.
-        _write_round(
-            {
-                # Carry the whole prior state for this branch, then overwrite what
-                # this write actually changes. Enumerating survivors one by one is
-                # what dropped `gate_demand` here while `reset_review_round` kept
+        clean_state = {
+            # Carry the whole prior state for this branch, then overwrite what
+            # this write actually changes. Enumerating survivors one by one is
+            # what dropped `gate_demand` here while `reset_review_round` kept
                 # it — two writers of one file disagreeing about its shape.
                 **_carry(_prev, branch),
-                "branch": branch,
-                "round": 0,
-                "lifetime": lifetime,
-                "last_hash": content_hash,
-                "last_source": "external",
-                "final_accept_consumed": consumed,
-            },
-            cwd,
-        )
+            "branch": branch,
+            "round": 0,
+            "lifetime": lifetime,
+            "last_hash": content_hash,
+            "last_source": "external",
+            "final_accept_consumed": consumed,
+        }
+        _retire_demands(clean_state, gate="escalation-cap", choice="clean-review")
+        _write_round(clean_state, cwd)
         return 0
     # Defect-bearing round. Nothing meaningfully staged ("clean") or a git error
     # ("unknown") is NOT a review round — counting it would inflate toward a
@@ -1010,11 +1047,7 @@ def reset_review_round(cwd: str | None = None) -> None:
             # ack's own last act is to call it. A satisfied demand records WHICH
             # remedy the user chose; dropping it here would erase the decision at
             # the exact moment it was made, which is the audit trail's only reader.
-            **(
-                {"gate_demand": state["gate_demand"]}
-                if isinstance(state.get("gate_demand"), dict)
-                else {}
-            ),
+            **_carry(state, branch),
         },
         cwd,
     )
@@ -1046,9 +1079,10 @@ def write_gate_demand(
     treat missing state as "no relaxation", never as "no requirement".
     """
     state = _load_round(cwd)
-    state["gate_demand"] = {
+    demand = {
         "gate": gate,
         "session_id": session_id or None,
+        "worktree_root": _worktree_root(cwd),
         "declared_at": time.time(),
         "remedies": [
             {"key": str(r.get("key", "")), "label": str(r.get("label", ""))}
@@ -1058,14 +1092,28 @@ def write_gate_demand(
         "required_action": required_action,
         "satisfied_with": None,
     }
+    rows = _demands(state)
+    rows = [
+        row
+        for row in rows
+        if not (
+            row.get("gate") == gate
+            and row.get("session_id") == demand["session_id"]
+            and row.get("satisfied_with") is None
+        )
+    ]
+    rows.append(demand)
+    state["gate_demands"] = rows
+    # Compatibility/readability alias for older consumers and hand inspection.
+    state["gate_demand"] = demand
     state.setdefault("branch", get_current_branch(cwd=cwd))
     _write_round(state, cwd)
 
 
 def read_gate_demand(
-    cwd: str | None = None, *, session_id: str | None = None
+    cwd: str | None = None, *, session_id: str | None = None, gate: str | None = None
 ) -> dict | None:
-    """The LIVE gate demand for this worktree's current branch, else None.
+    """The live demand owed by this session, locally or in its target worktree.
 
     Live means: present, well-shaped, carrying at least one remedy, belonging to
     the current branch, and not yet satisfied. A satisfied demand stays on disk as
@@ -1080,29 +1128,70 @@ def read_gate_demand(
     Never raises — ``_load_round`` already normalizes shape and value, and a
     non-object ``gate_demand`` from a hand edit is rejected here.
     """
+    def select(state: dict, *, exact_owner: bool) -> dict | None:
+        if state.get("branch") != get_current_branch(cwd=state.get("worktree_root") or cwd):
+            return None
+        candidates = []
+        for demand in _demands(state):
+            owner = demand.get("session_id")
+            if demand.get("satisfied_with") is not None or (gate and demand.get("gate") != gate):
+                continue
+            if session_id is not None:
+                if exact_owner and owner != session_id:
+                    continue
+                if not exact_owner and owner not in (None, session_id):
+                    continue
+            remedies = [
+                r
+                for r in demand.get("remedies", [])
+                if isinstance(r, dict) and r.get("key")
+            ]
+            if remedies:
+                candidates.append({**demand, "remedies": remedies})
+        # ``gate_demands`` is append ordered. Avoid parsing hand-editable
+        # timestamps here: this reader promises malformed state cannot raise.
+        return candidates[-1] if candidates else None
+
     state = _load_round(cwd)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd):
+    if state:
+        state.setdefault("worktree_root", _worktree_root(cwd))
+        found = select(state, exact_owner=False)
+        if found:
+            return found
+
+    # A blocked ``git -C <other-worktree> commit`` records against the target,
+    # while AskUserQuestion keeps the session cwd. Search only for an EXACT
+    # session owner; ownerless legacy records never escape their own worktree.
+    if session_id is None:
         return None
-    demand = state.get("gate_demand")
-    if not isinstance(demand, dict) or demand.get("satisfied_with") is not None:
-        return None
-    if session_id is not None and demand.get("session_id") not in (None, session_id):
-        # Someone else's obligation. An earlier revision scanned every round file
-        # on the box to work around the writer and reader keying on different
-        # directories; MEASURED, that let an unrelated worktree's session be
-        # refused a question about something else entirely. The demand carries
-        # the session that owes it instead.
-        return None
-    remedies = [
-        r for r in demand.get("remedies", []) if isinstance(r, dict) and r.get("key")
-    ]
-    if not remedies:
-        return None
-    return {**demand, "remedies": remedies}
+    for path in _ROUND_DIR.glob("*.json"):
+        if path == _round_file(cwd):
+            continue
+        try:
+            other = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(other, dict):
+            continue
+        roots = {
+            str(d.get("worktree_root"))
+            for d in _demands(other)
+            if d.get("session_id") == session_id and d.get("worktree_root")
+        }
+        for root in roots:
+            other["worktree_root"] = root
+            found = select(other, exact_owner=True)
+            if found:
+                return found
+    return None
 
 
 def satisfy_gate_demand(
-    choice: str, cwd: str | None = None, *, gate: str | None = None
+    choice: str,
+    cwd: str | None = None,
+    *,
+    gate: str | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Retire the live demand, recording WHICH remedy was chosen. Never raises.
 
@@ -1118,15 +1207,10 @@ def satisfy_gate_demand(
     erases is not a record.
     """
     state = _load_round(cwd)
-    demand = state.get("gate_demand")
-    if not isinstance(demand, dict):
-        return
-    if gate is not None and demand.get("gate") != gate:
-        return
-    demand["satisfied_with"] = choice
-    demand["satisfied_at"] = time.time()
-    state["gate_demand"] = demand
-    _write_round(state, cwd)
+    before = json.dumps(_demands(state), sort_keys=True)
+    _retire_demands(state, gate=gate, choice=choice, session_id=session_id)
+    if json.dumps(_demands(state), sort_keys=True) != before:
+        _write_round(state, cwd)
 
 
 def get_current_branch(cwd: str | None = None) -> str:

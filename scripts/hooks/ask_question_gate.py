@@ -122,7 +122,9 @@ def main() -> int:
         return 0
 
     by_key = {r["key"]: r.get("label") or r["key"] for r in remedies}
-    listed = "\n".join(f"  - {k}: {by_key[k]}" for k in missing)
+    listed = "\n".join(
+        f"  - {k}: {by_key[k]}" if k in by_key else f"  - {k}" for k in missing
+    )
     everything = "\n".join(f"  - {r['key']}: {r.get('label') or r['key']}" for r in remedies)
     print(
         f"BLOCKED: the '{demand.get('gate', 'gate')}' gate is waiting on a decision, "
@@ -133,7 +135,7 @@ def main() -> int:
         "The full declared set:\n"
         f"{everything}\n\n"
         "ONE question must offer EXACTLY these remedies: one option per remedy, "
-        "each recognisable by name in its LABEL (not only its description), and "
+        "each using its exact declared LABEL (or exact machine key), and "
         "NO other options in that question. An extra option is refused too — a "
         "menu carrying a choice this gate did not offer is not this gate's menu, "
         "whatever else it also contains.\n\n"

@@ -567,8 +567,8 @@ def _token_is_sigil(tok: str, sigil: str) -> bool:
     return bool(re.match(re.escape(sigil) + r"(?![-\w])", tok))
 
 
-def _leading_run_sigil_token(seg: str, sigil: str) -> str | None:
-    """The raw token for ``sigil`` in the segment's trailing comment, else None.
+def _leading_run_sigil_tokens(seg: str, sigil: str) -> list[str]:
+    """Every raw ``sigil`` token in the segment's leading comment run.
 
     The ONE walk both sigil readers share. Extracted so that "is the sigil
     present?" and "what argument does it carry?" can never disagree: a copied
@@ -584,9 +584,10 @@ def _leading_run_sigil_token(seg: str, sigil: str) -> str | None:
     token ahead of the sigil ends the run. This keeps independent acks able to
     coexist without letting an incidental or negated prose mention waive a gate.
 
-    Returns the token AS WRITTEN (``escalation-ack:redesign``), not the sigil, so
-    a caller can read whatever is bound to it.
+    Returns tokens AS WRITTEN (``escalation-ack:redesign``), so a caller can
+    inspect every value bound to repeated acknowledgments.
     """
+    found: list[str] = []
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -609,14 +610,21 @@ def _leading_run_sigil_token(seg: str, sigil: str) -> str | None:
         if c == "#" and prev_ws:
             for tok in seg[i + 1 :].split():
                 if _token_is_sigil(tok, sigil):
-                    return tok  # the queried sigil, reached within the leading run
+                    found.append(tok)
+                    continue
                 if not any(_token_is_sigil(tok, s) for s in _KNOWN_SIGILS):
-                    return None  # a prose token ends the leading run of sigils
+                    return found  # prose ends the leading run of sigils
                 # else: a DIFFERENT recognized sigil — still in the run, keep scanning
-            return None
+            return found
         prev_ws = c.isspace()
         i += 1
-    return None
+    return []
+
+
+def _leading_run_sigil_token(seg: str, sigil: str) -> str | None:
+    """First matching token, retained for the boolean compatibility API."""
+    tokens = _leading_run_sigil_tokens(seg, sigil)
+    return tokens[0] if tokens else None
 
 
 def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
@@ -789,6 +797,15 @@ def trailing_override_arg(seg: str, sigil: str) -> str | None:
     if not sep:
         return None
     return arg.strip() or None
+
+
+def trailing_override_args(seg: str, sigil: str) -> list[str | None]:
+    """All arguments bound to repeated instances of ``sigil`` in one comment."""
+    args: list[str | None] = []
+    for tok in _leading_run_sigil_tokens(seg, sigil):
+        _, sep, arg = tok.partition(":")
+        args.append(arg.strip() or None if sep else None)
+    return args
 
 
 def _argv(seg: str) -> list[str]:

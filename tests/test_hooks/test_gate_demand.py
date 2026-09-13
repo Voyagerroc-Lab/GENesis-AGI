@@ -37,13 +37,13 @@ def _q(*labels: str, question: str = "How should we proceed?") -> dict:
 
 class TestMissingRemedies:
     def test_a_question_offering_all_three_is_complete(self):
-        q = _q("Redesign it", "Narrow the scope", "Shelve it")
+        q = _q("robust-by-construction redesign", "narrow the scope", "shelve the change")
         assert gd.missing_remedies([q], REMEDIES) == []
 
     def test_the_measured_failure_is_caught(self):
         """2026-08-31: the relay dropped 'redesign', invented 'split the PR', and
         added 'ship as-is' — the outcome the cap exists to prevent."""
-        q = _q("Split the PR", "Ship as-is", "Narrow the scope", "Shelve it")
+        q = _q("Split the PR", "Ship as-is", "Narrow the scope", "shelve the change")
         assert gd.missing_remedies([q], REMEDIES) == ["redesign"]
 
     def test_an_empty_question_list_covers_nothing(self):
@@ -53,7 +53,7 @@ class TestMissingRemedies:
         """Splitting one decision into several questions presents them as
         independent choices, which is the corruption in another shape. ONE
         question must carry the whole set."""
-        qs = [_q("Redesign it"), _q("Narrow the scope"), _q("Shelve it")]
+        qs = [_q("redesign"), _q("narrow"), _q("shelve")]
         # Reported against the question that covers the MOST, so the message can
         # name what to add rather than restating the whole set.
         assert gd.missing_remedies(qs, REMEDIES) == ["narrow", "shelve"]
@@ -61,7 +61,10 @@ class TestMissingRemedies:
     def test_other_questions_may_ride_alongside(self):
         """The standing rule mandates >=2 questions per call, so an unrelated
         question sharing the call must never make the gate refuse."""
-        qs = [_q("Yes", "No", question="Unrelated?"), _q("Redesign it", "Narrow it", "Shelve it")]
+        qs = [
+            _q("Yes", "No", question="Unrelated?"),
+            _q("robust-by-construction redesign", "narrow the scope", "shelve the change"),
+        ]
         assert gd.missing_remedies(qs, REMEDIES) == []
 
     def test_the_description_does_NOT_carry_a_remedy(self):
@@ -75,6 +78,7 @@ class TestMissingRemedies:
         """
         q = {
             "question": "How?",
+            "multiSelect": False,
             "options": [
                 {"label": "Rebuild from the ground up", "description": "a redesign"},
                 {"label": "Cut it down", "description": "narrow the change"},
@@ -97,6 +101,11 @@ class TestMissingRemedies:
     def test_matching_is_case_insensitive(self):
         q = _q("REDESIGN", "Narrow", "shelve")
         assert gd.missing_remedies([q], REMEDIES) == []
+
+    def test_multi_select_cannot_represent_one_remedy_decision(self):
+        q = _q("redesign", "narrow", "shelve")
+        q["multiSelect"] = True
+        assert gd.missing_remedies([q], REMEDIES) == ["redesign", "narrow", "shelve"]
 
     def test_malformed_questions_are_ignored_not_crashed_on(self):
         """The payload is harness-shaped and may drift; a shape surprise must
@@ -137,12 +146,12 @@ class TestCoverageIsABijection:
         that one binds; `narrow` and `shelve` have nowhere left to go.)"""
         assert gd.missing_remedies(
             [_q("redesign narrow shelve — pick later", "Ship as-is")], REMEDIES
-        ) == ["narrow", "shelve"]
+        ) == ["redesign", "narrow", "shelve"]
 
     def test_an_option_naming_two_remedies_binds_only_one(self):
         """Ambiguity leaves a remedy unoffered — the user cannot pick the other."""
         q = _q("Redesign or narrow it", "Shelve it")
-        assert gd.missing_remedies([q], REMEDIES) == ["narrow"]
+        assert gd.missing_remedies([q], REMEDIES) == ["redesign", "narrow", "shelve"]
 
     def test_the_two_step_bypass_is_closed(self):
         """Adding the options a refusal names must not launder the dismissal.
@@ -153,7 +162,7 @@ class TestCoverageIsABijection:
         q = _q(
             "Ship as-is",
             "Narrow the scope",
-            "Shelve it",
+            "shelve the change",
         )
         q["options"][0]["description"] = "rather than redesign, narrow, or shelve"
         assert gd.missing_remedies([q], REMEDIES) == ["redesign"]
@@ -161,7 +170,8 @@ class TestCoverageIsABijection:
     def test_distinct_options_still_pass(self):
         """The control: injectivity must not break the ordinary compliant ask."""
         assert gd.missing_remedies(
-            [_q("Redesign it", "Narrow the scope", "Shelve it")], REMEDIES
+            [_q("robust-by-construction redesign", "narrow the scope", "shelve the change")],
+            REMEDIES,
         ) == []
 
     def test_an_extra_option_is_REFUSED(self):
@@ -175,14 +185,30 @@ class TestCoverageIsABijection:
         option that makes it a bypass.
         """
         missing = gd.missing_remedies(
-            [_q("Redesign it", "Narrow the scope", "Shelve it", "Ship as-is")], REMEDIES
+            [
+                _q(
+                    "robust-by-construction redesign",
+                    "narrow the scope",
+                    "shelve the change",
+                    "Ship as-is",
+                )
+            ],
+            REMEDIES,
         )
         assert missing, "an unsanctioned option must not pass"
         assert "Ship as-is" in missing[0]
 
     def test_the_refusal_names_the_option_that_was_not_offered(self):
         missing = gd.missing_remedies(
-            [_q("Redesign it", "Narrow the scope", "Shelve it", "Split the PR")], REMEDIES
+            [
+                _q(
+                    "robust-by-construction redesign",
+                    "narrow the scope",
+                    "shelve the change",
+                    "Split the PR",
+                )
+            ],
+            REMEDIES,
         )
         assert missing == ["options this gate did not offer: Split the PR"]
 
@@ -194,8 +220,9 @@ class TestCoverageIsABijection:
         """
         q = {
             "question": "How?",
+            "multiSelect": False,
             "options": [
-                {"label": "Redesign it", "description": ""},
+                {"label": "robust-by-construction redesign", "description": ""},
                 {"label": "Narrow the scope", "description": ""},
                 {"label": "Ship as-is", "description": "neither shelve nor rework"},
             ],
@@ -213,6 +240,10 @@ class TestCoverageIsABijection:
         }
         assert gd.missing_remedies([q], REMEDIES) == ["redesign", "narrow", "shelve"]
 
+    def test_negations_in_the_labels_are_not_offers(self):
+        q = _q("Do not redesign", "Do not narrow", "Do not shelve")
+        assert gd.missing_remedies([q], REMEDIES) == ["redesign", "narrow", "shelve"]
+
     def test_an_honest_menu_whose_descriptions_mention_siblings_PASSES(self):
         """The false-block direction, which matters as much as the bypass.
 
@@ -221,10 +252,14 @@ class TestCoverageIsABijection:
         """
         q = {
             "question": "How?",
+            "multiSelect": False,
             "options": [
-                {"label": "Redesign it", "description": "rebuild rather than narrow the fix"},
+                {
+                    "label": "robust-by-construction redesign",
+                    "description": "rebuild rather than narrow the fix",
+                },
                 {"label": "Narrow the scope", "description": "ship the converging part, shelve the rest"},
-                {"label": "Shelve it", "description": ""},
+                {"label": "shelve the change", "description": ""},
             ],
         }
         assert gd.missing_remedies([q], REMEDIES) == []

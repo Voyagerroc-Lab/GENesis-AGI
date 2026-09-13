@@ -21,8 +21,6 @@ raise out of a hook — but it must never silently certify either.
 
 from __future__ import annotations
 
-import re
-
 
 def _label(option: object) -> str:
     """An option's LABEL only.
@@ -35,7 +33,26 @@ def _label(option: object) -> str:
     return str(option.get("label", "")) if isinstance(option, dict) else ""
 
 
-def _unmatched(question: object, keys: list[str]) -> list[str]:
+def _normalized_label(value: str) -> str:
+    """Case/whitespace-normalized label; wording remains exact."""
+    return " ".join(value.casefold().split())
+
+
+def _matches_label(option: object, remedy: dict) -> bool:
+    """True only for the declared label or its exact machine key.
+
+    The session controls option prose, so substring matching cannot distinguish
+    an offer from a negation (``Do not redesign``) or an ambiguous compound
+    (``redesign or narrow``). Exact declared labels make the choice structural.
+    """
+    label = _normalized_label(_label(option))
+    return label in {
+        _normalized_label(str(remedy.get("key", ""))),
+        _normalized_label(str(remedy.get("label", ""))),
+    } - {""}
+
+
+def _unmatched(question: object, remedies: list[dict]) -> list[str]:
     """Remedy keys with no option of their own — where the question's option set
     must BE the remedy set, one option each and nothing else.
 
@@ -63,16 +80,18 @@ def _unmatched(question: object, keys: list[str]) -> list[str]:
     belongs in a second question, where it is the session's own, not presented as
     though the gate offered it.
     """
-    if not isinstance(question, dict):
+    keys = [str(r["key"]) for r in remedies]
+    if not isinstance(question, dict) or question.get("multiSelect") is not False:
         return list(keys)
     options = question.get("options")
     if not isinstance(options, list):
         return list(keys)
     taken: set[int] = set()
     missing: list[str] = []
-    for key in keys:
+    for remedy in remedies:
+        key = str(remedy["key"])
         for i, option in enumerate(options):
-            if i not in taken and _matches_label(option, key):
+            if i not in taken and _matches_label(option, remedy):
                 taken.add(i)
                 break
         else:
@@ -88,11 +107,6 @@ def _unmatched(question: object, keys: list[str]) -> list[str]:
 
 
 _EXTRA_PREFIX = "options this gate did not offer: "
-
-
-def _matches_label(option: object, key: str) -> bool:
-    pattern = re.compile(rf"(?<!\w){re.escape(key)}(?!\w)", re.IGNORECASE)
-    return bool(pattern.search(_label(option)))
 
 
 def missing_remedies(questions: object, remedies: list[dict]) -> list[str]:
@@ -111,14 +125,15 @@ def missing_remedies(questions: object, remedies: list[dict]) -> list[str]:
     what to add rather than restating the entire set. Returns ``[]`` when some
     question covers everything, and when there is nothing to cover.
     """
-    keys = [str(r.get("key", "")) for r in remedies if isinstance(r, dict) and r.get("key")]
-    if not keys:
+    declared = [r for r in remedies if isinstance(r, dict) and r.get("key")]
+    keys = [str(r["key"]) for r in declared]
+    if not declared:
         return []
     if not isinstance(questions, list) or not questions:
         return list(keys)
     best: list[str] | None = None
     for question in questions:
-        missing = _unmatched(question, keys)
+        missing = _unmatched(question, declared)
         if not missing:
             return []
         if best is None or len(missing) < len(best):

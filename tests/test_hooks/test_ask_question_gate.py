@@ -59,14 +59,14 @@ def home(tmp_path: Path) -> Path:
     return h
 
 
-def _declare(repo: Path, home: Path) -> None:
+def _declare(repo: Path, home: Path, *, session_id: str | None = None) -> None:
     """Write a live demand into the redirected HOME's round store."""
     env = {**os.environ, "HOME": str(home)}
     code = (
         f"import sys; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r});"
         "import review_state as rs;"
         f"rs.write_gate_demand(gate='escalation-cap', remedies={REMEDIES!r},"
-        f" required_action='relay them', cwd={str(repo)!r})"
+        f" required_action='relay them', cwd={str(repo)!r}, session_id={session_id!r})"
     )
     subprocess.run(
         [sys.executable, "-c", code], env=env, cwd=str(repo), check=True, capture_output=True
@@ -122,8 +122,40 @@ def test_no_demand_means_no_interference(repo, home):
 
 def test_an_ask_carrying_every_remedy_passes(repo, home):
     _declare(repo, home)
-    res = _ask(repo, home, [_q("Redesign it", "Narrow the scope", "Shelve it")])
+    res = _ask(
+        repo,
+        home,
+        [_q("robust-by-construction redesign", "narrow the scope", "shelve the change")],
+    )
     assert res.returncode == 0, res.stderr
+
+
+def test_extra_option_is_blocked_without_crashing_open(repo, home):
+    _declare(repo, home)
+    res = _ask(
+        repo,
+        home,
+        [
+            _q(
+                "robust-by-construction redesign",
+                "narrow the scope",
+                "shelve the change",
+                "Ship as-is",
+            )
+        ],
+    )
+    assert res.returncode == 2, res.stderr
+    assert "Ship as-is" in res.stderr
+    assert "GUARD ERROR" not in res.stderr
+
+
+def test_session_finds_demand_recorded_for_git_c_target(repo, home):
+    target = repo.parent / "target"
+    shutil.copytree(repo, target)
+    _declare(target, home, session_id="test")
+    res = _ask(repo, home, [_q("Ship as-is")])
+    assert res.returncode == 2, res.stderr
+    assert "escalation-cap" in res.stderr
 
 
 def test_the_measured_corruption_is_blocked(repo, home):
@@ -145,7 +177,10 @@ def test_an_unrelated_question_may_ride_alongside(repo, home):
     res = _ask(
         repo,
         home,
-        [_q("A", "B", question="Unrelated?"), _q("Redesign it", "Narrow it", "Shelve it")],
+        [
+            _q("A", "B", question="Unrelated?"),
+            _q("robust-by-construction redesign", "narrow the scope", "shelve the change"),
+        ],
     )
     assert res.returncode == 0, res.stderr
 

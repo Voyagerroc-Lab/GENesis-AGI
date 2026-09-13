@@ -711,9 +711,15 @@ def _acked_remedy(
     # which is a real configuration on this box. A call-time import instead raises
     # inside main(), where run_guard converts it to a hard BLOCK. Same dependency,
     # opposite failure.
-    from shell_parse import trailing_override_arg
+    from shell_parse import trailing_override_args
 
-    return True, {trailing_override_arg(s.raw, sigil) for s in segs}
+    args: set[str | None] = set()
+    for segment in segs:
+        values = trailing_override_args(segment.raw, sigil)
+        if not values:
+            return False, set()
+        args.update(values)
+    return True, args
 
 
 def _merge_note(cwd: str | None) -> str:
@@ -836,6 +842,7 @@ def main() -> None:
             has_valid_review_marker,
             is_review_current,
             marker_content_current,
+            read_gate_demand,
             reset_review_round,
             satisfy_gate_demand,
         )
@@ -1073,7 +1080,7 @@ def main() -> None:
         # progress just appends it again, which is the fourth repeatable escape hatch
         # this tier exists to remove. The acceptance is spent on first use and the
         # branch cannot buy another.
-        if final_acked and get_final_accept_consumed(cwd=cwd):
+        if get_final_accept_consumed(cwd=cwd):
             _deny(
                 f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
                 f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
@@ -1141,7 +1148,12 @@ def main() -> None:
         # question on the branch must offer the accept/abandon menu, including
         # questions about something else entirely: a permanent false block on an
         # unrelated tool, long after the decision was made.
-        satisfy_gate_demand("accept", cwd=cwd, gate="final-round-cap")
+        satisfy_gate_demand(
+            "accept",
+            cwd=cwd,
+            gate="final-round-cap",
+            session_id=payload.get("session_id"),
+        )
         # Acked = the accept decision was made. Deliberately NO reset: the counter
         # stays at/above the terminal so the next commit blocks again. The spend is
         # DEFERRED to the allow (see `_allow` above) — the later rules can still
@@ -1157,6 +1169,30 @@ def main() -> None:
         named = sorted(a for a in args if a)
         conflicting = named if len(args) > 1 and None not in args else []
         partly_bare = named if len(args) > 1 and None in args else []
+        session_id = payload.get("session_id")
+        if spend_final_accept and choice in valid_keys and not read_gate_demand(
+            cwd=cwd, session_id=session_id, gate="escalation-cap"
+        ):
+            required = (
+                "The terminal decision is recorded. Now present the escalation "
+                "remedies as a separate user decision before acknowledging one."
+            )
+            _declare_remedies(
+                _ESCALATION_REMEDIES,
+                gate="escalation-cap",
+                required_action=required,
+                cwd=cwd,
+                session_id=session_id,
+            )
+            _deny(
+                "BLOCKED: the final-round and escalation decisions cannot be "
+                "collapsed into one invented acknowledgment. "
+                + required
+                + "\n\n"
+                + _render_remedies(_ESCALATION_REMEDIES, "escalation-ack")
+                + _merge_note(cwd)
+            )
+            return
         if not acked or choice not in valid_keys:
             required = (
                 "STOP and get a FRESH user decision on how to proceed, relaying the "
@@ -1209,7 +1245,24 @@ def main() -> None:
                 + _merge_note(cwd)
             )
             return
-        satisfy_gate_demand(choice, cwd=cwd, gate="escalation-cap")
+        if choice == "shelve":
+            satisfy_gate_demand(
+                choice,
+                cwd=cwd,
+                gate="escalation-cap",
+                session_id=session_id,
+            )
+            _deny(
+                "BLOCKED: the selected remedy is to shelve this change. That is "
+                "a decision to stop; it cannot authorize the commit it postpones."
+            )
+            return
+        satisfy_gate_demand(
+            choice,
+            cwd=cwd,
+            gate="escalation-cap",
+            session_id=session_id,
+        )
         # Acked = a fresh decision to continue → reset the round budget so the next
         # stop is a fresh cap away, not per-commit friction for the branch's whole
         # life. Reset stands even if a later rule blocks THIS commit: the

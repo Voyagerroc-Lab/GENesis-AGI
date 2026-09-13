@@ -2396,8 +2396,9 @@ wrong for this change, that is a conversation about which remedies it should
 OFFER — not a side door around the ones it does.
 
 **The shape the covering question must have**, because getting it wrong costs a
-round-trip: ONE option per remedy, each remedy recognisable by name in the
-option's LABEL, and no other options in that question. It is a bijection — that
+round-trip: `multiSelect: false`, ONE option per remedy, each option's LABEL
+equal to the exact declared label or exact machine key (case and whitespace are
+normalised), and no other options in that question. It is a bijection — that
 question's options ARE the remedy set.
 
 Both halves bite. A missing remedy is refused, and so is an EXTRA option: a menu
@@ -2409,6 +2410,14 @@ remedies and added "ship as-is" beside them.
 Descriptions do not count, only labels. A description is prose about an option;
 the label is what the user picks, and matching prose let `"Ship as-is / neither
 shelve nor rework"` register as offering `shelve`.
+
+Each live demand is stored independently with the session and target worktree
+that owe it. This lets a demand created by `git -C <worktree> commit` reach an
+AskUserQuestion call made from the session's original cwd without exposing an
+ownerless legacy demand, or another session's decision, across worktrees. A clean
+external confirmation retires the escalation demand. Selecting `shelve` records
+the choice but continues to refuse the commit, because shelving is a decision to
+stop that commit.
 
 If you need a further choice, put it in a SECOND question. Other questions ride
 along freely — the convention already asks for at least two — and there it is

@@ -886,6 +886,17 @@ class TestTrailingOverrideArg:
         seg = 'git commit -m "x"  # escalation-ack:'
         assert sp.trailing_override_arg(seg, "escalation-ack") is None
 
+    def test_repeated_conflicting_arguments_are_all_visible(self):
+        seg = (
+            'git commit -m "x"  # escalation-ack:redesign '
+            "escalation-ack:shelve"
+        )
+        assert sp.trailing_override_args(seg, "escalation-ack") == ["redesign", "shelve"]
+
+    def test_repeated_named_and_bare_arguments_are_all_visible(self):
+        seg = 'git commit -m "x"  # escalation-ack:redesign escalation-ack'
+        assert sp.trailing_override_args(seg, "escalation-ack") == ["redesign", None]
+
     def test_argument_is_not_confused_with_a_longer_sigil_name(self):
         seg = 'git commit -m "x"  # escalation-ack-extra:redesign'
         assert sp.trailing_override_arg(seg, "escalation-ack") is None

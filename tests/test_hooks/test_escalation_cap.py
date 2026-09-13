@@ -482,6 +482,20 @@ def _write_round_file(repo, content: str) -> None:
     rf.write_text(content)
 
 
+def test_round_write_cleans_up_temp_when_replace_fails(repo, _isolate_rounds, monkeypatch):
+    """A failed best-effort publish must not strand its scratch file."""
+
+    def fail_replace(_src, _dst):
+        raise OSError("forced replace failure")
+
+    monkeypatch.setattr(review_state.os, "replace", fail_replace)
+    review_state._write_round({"branch": "main", "round": 1}, str(repo))
+
+    round_file = review_state._round_file(str(repo))
+    assert not round_file.exists()
+    assert list(round_file.parent.glob("*.tmp")) == []
+
+
 @pytest.mark.parametrize("bad", ["[]", "42", '"str"', "null", "[1, 2, 3]"])
 def test_load_round_returns_empty_for_non_dict(repo, _isolate_rounds, bad):
     # Valid JSON that is not an object (manual edit / schema skew) must normalize to
@@ -995,7 +1009,7 @@ def test_final_round_accept_is_one_shot(repo, home):
     assert first.returncode == 0, first.stderr
     again = _run_hook('git commit -m "another"', repo, home)
     assert again.returncode == 2, again.stdout + again.stderr
-    assert "final" in again.stderr.lower()
+    assert "already used" in again.stderr.lower()
 
 
 def test_final_round_accept_cannot_be_reused(repo, home):
@@ -1112,34 +1126,14 @@ def test_below_final_round_the_normal_cycle_still_applies(repo, home):
     assert res.returncode == 0, res.stdout + res.stderr
 
 
-def _refund_final_accept(repo: Path, home: Path) -> None:
-    """Clear the spent-acceptance flag so one test can exercise two acked commits.
-
-    Only for tests whose subject is something OTHER than consumption (sigil parse
-    order, message content). Consumption itself is covered by
-    test_final_round_accept_cannot_be_reused and friends, which must never call this.
-    """
-    env = {**os.environ, "HOME": str(home)}
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"import sys, json; sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r}); "
-            f"import review_state as r; st = r._load_round({str(repo)!r}); "
-            # Refuse to write back an empty counter: that would silently disarm the
-            # terminal and turn the caller GREEN while testing nothing.
-            "assert st.get('lifetime'), f'refund would blank the counter: {st!r}'; "
-            "st.pop('final_accept_consumed', None); "
-            f"r._write_round(st, {str(repo)!r})",
-        ],
-        env=env,
-        check=True,
-        capture_output=True,
-        timeout=30,
-    )
-
-
-def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
+@pytest.mark.parametrize(
+    "cmd",
+    (
+        'git commit -m "wip"  # final-round-accept escalation-ack:redesign',
+        'git commit -m "wip"  # escalation-ack:redesign final-round-accept',
+    ),
+)
+def test_terminal_and_cap_together_accept_either_sigil_order(repo, home, cmd):
     """streak>=3 AND lifetime>=7 is reachable, and BOTH sigils are then required.
 
     This is the state the unregistered-sigil bug deadlocked in ONE token order:
@@ -1154,16 +1148,15 @@ def test_terminal_and_cap_together_accept_either_sigil_order(repo, home):
     blocked = _run_hook('git commit -m "wip"', repo, home)
     assert blocked.returncode == 2, "control: both tiers must be live here"
     assert "FINAL ROUND" in blocked.stderr, "the terminal must be the one blocking"
-    for cmd in (
-        'git commit -m "wip"  # final-round-accept escalation-ack:redesign',
-        'git commit -m "wip"  # escalation-ack:redesign final-round-accept',
-    ):
-        # The first accepted commit SPENDS the acceptance, so without this the
-        # second order would be blocked by consumption rather than by parsing —
-        # a green/red that says nothing about the property under test.
-        _refund_final_accept(repo, home)
-        res = _run_hook(cmd, repo, home)
-        assert res.returncode == 0, f"{cmd} -> {res.returncode}: {res.stderr}"
+    # One command cannot answer two questions that were not both presented.
+    # The first invocation records terminal acceptance, declares the next gate,
+    # and refuses. Repeating the explicit pair then answers the live escalation
+    # demand; either token order must parse identically.
+    first = _run_hook(cmd, repo, home)
+    assert first.returncode == 2, f"{cmd} -> {first.returncode}: {first.stderr}"
+    assert "cannot be collapsed" in first.stderr
+    second = _run_hook(cmd, repo, home)
+    assert second.returncode == 0, f"{cmd} -> {second.returncode}: {second.stderr}"
 
 
 def test_terminal_message_names_the_co_required_sigil(repo, home):
@@ -1425,6 +1418,24 @@ def test_a_compound_with_one_bare_segment_says_so(repo, home):
     assert "Only some segments named a remedy" in res.stderr
 
 
+def test_conflicting_repeated_ack_in_one_segment_is_refused(repo, home):
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    res = _run_hook(
+        COMMIT_WIP + "  # escalation-ack:redesign escalation-ack:shelve",
+        repo,
+        home,
+    )
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "different segments" in res.stderr or "not a decision" in res.stderr
+
+
+def test_shelve_choice_never_authorizes_the_commit(repo, home):
+    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
+    res = _run_hook(COMMIT_WIP + "  # escalation-ack:shelve", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "selected remedy is to shelve" in res.stderr
+
+
 def test_the_terminal_demand_is_retired_when_its_sigil_is_honoured(repo, home):
     """A declare with no satisfy is a permanent false block.
 
@@ -1439,12 +1450,17 @@ def test_the_terminal_demand_is_retired_when_its_sigil_is_honoured(repo, home):
     demand = json.loads(files[0].read_text())["gate_demand"]
     assert demand["gate"] == "final-round-cap"
     assert demand["satisfied_with"] is None
+    next_gate = _run_hook(
+        COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home
+    )
+    assert next_gate.returncode == 2, next_gate.stdout + next_gate.stderr
+    state = json.loads(files[0].read_text())
+    terminal = next(d for d in state["gate_demands"] if d["gate"] == "final-round-cap")
+    assert terminal["satisfied_with"] == "accept"
     ok = _run_hook(
         COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home
     )
     assert ok.returncode == 0, ok.stdout + ok.stderr
-    demand = json.loads(files[0].read_text())["gate_demand"]
-    assert demand["satisfied_with"] == "accept"
 
 
 def test_an_external_mark_does_not_disarm_the_ask_gate(repo, _isolate_rounds):
@@ -1488,6 +1504,39 @@ def test_a_demand_is_scoped_to_the_session_that_owes_it(_isolate_rounds, repo):
     # No session id supplied (an older payload shape) still sees it — the filter
     # narrows, it never invents an owner.
     assert review_state.read_gate_demand(cwd=str(repo)) is not None
+
+
+def test_two_sessions_in_one_worktree_keep_independent_demands(_isolate_rounds, repo):
+    for session in ("sess-A", "sess-B"):
+        review_state.write_gate_demand(
+            gate="escalation-cap",
+            remedies=[{"key": "redesign", "label": "redesign it"}],
+            required_action="relay them",
+            cwd=str(repo),
+            session_id=session,
+        )
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is not None
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-B") is not None
+    review_state.satisfy_gate_demand(
+        "redesign", cwd=str(repo), gate="escalation-cap", session_id="sess-A"
+    )
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is None
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-B") is not None
+
+
+def test_clean_review_retires_live_escalation_demand(_isolate_rounds, repo):
+    review_state.write_gate_demand(
+        gate="escalation-cap",
+        remedies=[{"key": "redesign", "label": "redesign it"}],
+        required_action="relay them",
+        cwd=str(repo),
+        session_id="sess-A",
+    )
+    _stage(repo, "clean = 1\n")
+    assert review_state.bump_review_round(cwd=str(repo), source="external", clean=True) == 0
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is None
+    raw = json.loads(review_state._round_file(str(repo)).read_text())
+    assert raw["gate_demand"]["satisfied_with"] == "clean-review"
 
 
 def test_a_demand_with_no_recorded_owner_is_visible_to_any_session(_isolate_rounds, repo):
