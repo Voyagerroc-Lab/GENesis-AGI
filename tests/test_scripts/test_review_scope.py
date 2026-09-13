@@ -713,6 +713,57 @@ def test_lane_vendored_only_is_light():
     )
 
 
+def test_lane_dependency_pins_are_NOT_light():
+    """`.txt` alone is not prose. `requirements.txt` and
+    `config/az-pip-constraints.txt` are dependency pins that reach
+    `_category() == "docs-config"`; admitting every `.txt` gave them a 3.0
+    budget one line under a comment saying config is not prose."""
+    assert _rs.classify_lane(["requirements.txt"], hook_surface=False) == "standard"
+    assert _rs.classify_lane(
+        ["config/az-pip-constraints.txt"], hook_surface=False
+    ) == "standard"
+
+
+def test_lane_a_doc_stem_with_txt_is_still_light():
+    """The other half of that split, so tightening `.txt` did not take prose with
+    it: a KNOWN doc stem keeps `.txt`, mirroring `git_push_guard._is_doc_path`."""
+    assert _rs.classify_lane(["CHANGELOG.txt"], hook_surface=False) == "light"
+    assert _rs.classify_lane(["LICENSE"], hook_surface=False) == "light"
+
+
+def test_lane_every_authority_outranks_the_vendored_strip():
+    """`_is_vendored` REMOVES a path from `reviewable`, so anything that must
+    outrank a vendor glob has to be checked before the strip — not after it.
+
+    Both spellings measured: each of these is `_is_vendored` via `*/generated/*`
+    and each returned `light` while its check sat below the strip. The hook-surface
+    one was found first and fixed alone; `.github/` was the same class one line
+    away and a second reviewer had to find it. This test pins BOTH so the next
+    authority added cannot be placed on the wrong side of the strip quietly.
+    """
+    assert _rs._is_vendored("scripts/hooks/generated/x.py"), "precondition: vendored"
+    assert _rs._is_vendored(".github/generated/ci.yml"), "precondition: vendored"
+    assert _rs.classify_lane(
+        ["scripts/hooks/generated/x.py"], hook_surface=True
+    ) == "critical"
+    assert _rs.classify_lane([".github/generated/ci.yml"], hook_surface=False) == "critical"
+
+
+def test_lane_real_api_modules_are_critical():
+    """`_SCOPE_PATTERNS`' api globs are `*controller* *route* *endpoint* */api/*`,
+    which miss a module simply NAMED `api.py` or `api_*.py` — those tag `backend`.
+    MEASURED: `src/genesis/outreach/api.py` defines Flask routes and classified
+    `standard`. Closed by name in `_is_lane_critical_path` rather than by widening
+    `_SCOPE_PATTERNS`, whose blast radius includes the blocking depth gate."""
+    assert _rs._scope_tag("src/genesis/outreach/api.py") == "backend", (
+        "precondition: the inherited tagger still misses this, or the test proves nothing"
+    )
+    assert _rs.classify_lane(["src/genesis/outreach/api.py"], hook_surface=False) == "critical"
+    assert _rs.classify_lane(
+        ["az_plugins/genesis/api_health.py"], hook_surface=False
+    ) == "critical"
+
+
 def test_lane_critical_beats_light_when_mixed():
     """Guard the guard on ordering: a docs-heavy PR that also touches a migration
     is critical, not light. The checks must not be order-dependent in the wrong

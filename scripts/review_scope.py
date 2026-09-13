@@ -677,10 +677,48 @@ _LANE_SENSITIVE_TAGS = frozenset({"api", "migrations"})
 # substantiality classifier treats YAML as docs/config (review-trivial)". That
 # fence covers ENFORCEMENT config only; this keeps the rest out of `light`
 # rather than extending the relaxation to it.
-_LANE_LIGHT_DOC_EXTS = frozenset({".md", ".rst", ".txt", ".markdown", ".adoc"})
+# Prose extensions. `.txt` is NOT here: `requirements.txt` and
+# `config/az-pip-constraints.txt` are dependency pins, and admitting every `.txt`
+# handed them a 3.0 budget one line under a comment saying config is not prose.
+# It counts only on a known documentation STEM below — the same split
+# `git_push_guard._is_doc_path` already makes, mirrored so the two cannot
+# disagree about what a `.txt` is.
+#
+# Only `.md` and `.rst` are listed, and that is the REACHABLE set rather than the
+# desirable one. `_category()` runs first and admits only `_is_docs_or_config`'s
+# extensions ({.md .rst .txt .yaml .yml .toml .ini .cfg}); everything else — a
+# `.markdown`, an `.adoc`, an extensionless `README` — is category `code` and
+# never arrives here at all. MEASURED: each of those classifies `standard`.
+# Listing them anyway would advertise coverage this function does not have, which
+# is the same claim-without-a-test shape the rest of this file argues against.
+# The fail direction is the safe one: unrecognised prose is reviewed as ordinary
+# code, never as light.
+_LANE_LIGHT_DOC_EXTS = frozenset({".md", ".rst"})
 _LANE_LIGHT_DOC_STEMS = frozenset(
     {"CHANGELOG", "README", "LICENSE", "NOTICE", "COPYING", "AUTHORS", "CONTRIBUTING"}
 )
+_LANE_LIGHT_STEM_EXTS = _LANE_LIGHT_DOC_EXTS | {".txt", "."}
+
+
+def _is_lane_critical_path(path: str) -> bool:
+    """Consequence surfaces the inherited `_scope_tag` vocabulary MISSES.
+
+    `_SCOPE_PATTERNS`' `api` globs are `*controller* *route* *endpoint* */api/*`,
+    which catch this repo's dashboard routes but NOT a module simply named
+    `api.py` or `api_*.py` — those tag `backend`. MEASURED: both
+    `src/genesis/outreach/api.py` (which defines Flask routes) and
+    `az_plugins/genesis/api_health.py` classified `standard`, a false NEGATIVE on
+    the lane's own stated critical set. Closed here BY NAME rather than by
+    widening `_SCOPE_PATTERNS`, whose blast radius is the blocking commit depth
+    gate plus four other consumers.
+
+    `.github/` is also checked here, and again BEFORE the vendored strip in
+    `classify_lane`, for the reason written there.
+    """
+    if path.startswith(".github/"):
+        return True
+    base = os.path.basename(path)
+    return base == "api.py" or (base.startswith("api_") and base.endswith(".py"))
 
 
 def _is_lane_light(path: str) -> bool:
@@ -691,10 +729,11 @@ def _is_lane_light(path: str) -> bool:
     if category != "docs-config":
         return False
     base = os.path.basename(path)
-    stem, _, ext = base.rpartition(".")
-    return (
-        f".{ext.lower()}" in _LANE_LIGHT_DOC_EXTS or (stem or base).upper() in _LANE_LIGHT_DOC_STEMS
-    )
+    stem, dot, ext = base.rpartition(".")
+    ext = f".{ext.lower()}" if dot else "."
+    if (stem if dot else base).upper() in _LANE_LIGHT_DOC_STEMS:
+        return ext in _LANE_LIGHT_STEM_EXTS
+    return ext in _LANE_LIGHT_DOC_EXTS
 
 
 def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
@@ -719,14 +758,19 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     """
     if not paths:
         return "critical"
+    # EVERY consequence AUTHORITY is settled before the vendored heuristic,
+    # because `_is_vendored` strips a path from `reviewable` entirely and a
+    # stripped path can no longer be judged by anything below. MEASURED, both
+    # spellings: `scripts/hooks/generated/x.py` (hook surface) and
+    # `.github/generated/ci.yml` (CI config) are each `_is_vendored` via
+    # `*/generated/*`, and each returned `light` while these checks sat under
+    # the strip. The first was found by review and fixed HERE ONLY; the second
+    # was the same class one line away, and a reviewer had to find it too.
+    # Anything added below that must outrank a vendor glob belongs in THIS
+    # block, not after the strip.
     if hook_surface:
-        # The caller's fence is an AUTHORITY, not a heuristic, so it is settled
-        # FIRST — ahead of the vendored short-circuit below, which would
-        # otherwise hand `light` to a hook file that happens to match a vendor
-        # glob. MEASURED: `scripts/hooks/generated/x.py` is both hook surface and
-        # `_is_vendored`, and alone in a PR it returned `light` when this check
-        # sat second. A contrived path today; a fence inversion in the one fence
-        # this design exists to protect.
+        return "critical"
+    if any(p.startswith(".github/") for p in paths):
         return "critical"
     reviewable = [p for p in paths if not _is_vendored(p)]
     if not reviewable:
@@ -735,7 +779,7 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     # `.github/` is not hook surface, but a change here can disable a required
     # check as effectively as editing a gate — the rationale already written into
     # `.github/labeler.yml`'s `ci-config` label.
-    if any(p.startswith(".github/") for p in reviewable):
+    if any(_is_lane_critical_path(p) for p in reviewable):
         return "critical"
     if any(_scope_tag(p) in _LANE_SENSITIVE_TAGS for p in reviewable):
         return "critical"

@@ -3094,7 +3094,7 @@ The review-findings gate specifically:
 
    | lane | blocks at | what lands there |
    |---|---|---|
-   | `critical` | **1.0** | enforcement-hook surface, `.github/**`, `api` or `migrations` paths |
+   | `critical` | **1.0** | enforcement-hook surface, `.github/**`, `api`/`migrations`-tagged paths, and modules named `api.py` / `api_*.py` |
    | `standard` | **2.0** | ordinary runtime code |
    | `light` | **3.0** | PROSE / tests / fixtures only, or vendored-only |
 
@@ -3102,9 +3102,13 @@ The review-findings gate specifically:
    reaches `_category() == "docs-config"` through the shared classifier, but
    config is not documentation — `config/desktop_takeover.yaml` arms desktop
    takeover and `pyproject.toml` pins dependencies, so both are `standard`. The
-   light lane is `.md`/`.rst`/`.txt` and the known doc stems, plus tests and
-   fixtures (`review_scope._is_lane_light`). The first cut of this lane used the
-   whole `docs-config` category and handed config a 3.0 budget.
+   light lane is `.md`/`.rst`, plus `.txt` ONLY on a known documentation stem
+   (`CHANGELOG.txt` yes, `requirements.txt` no — the same split
+   `_is_doc_path` makes), plus tests and fixtures
+   (`review_scope._is_lane_light`). Unrecognised prose spellings — `.adoc`, an
+   extensionless `README` — are category `code` and classify `standard`: the
+   fail direction is the safe one, and the light set lists only what can
+   actually reach it rather than what would be nice.
 
    So on a CRITICAL change two P2s still block exactly as before; on ordinary
    code it now takes four. MEASURED over the 40 most recently merged PRs:
