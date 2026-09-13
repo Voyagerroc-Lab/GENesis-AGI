@@ -1702,8 +1702,10 @@ def test_depth_hint_says_sigils_bind_per_commit_segment(
     single commit and wrong for the supported chained shape
     (`git commit … && git commit --amend …`), where it binds only the last.
 
-    MEASURED: chained with one trailing comment -> rc=2; the same chain with the
-    sigil run repeated on each segment -> rc=0.
+    MEASURED: chained with one trailing comment -> rc=2; the same multi-line
+    command with the sigil run repeated on each segment -> rc=0.  A comment
+    ends at the physical line, so putting ``&&`` after one would never execute
+    the second command in Bash.
     """
     _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
     _begin_merge(repo)
@@ -1720,9 +1722,51 @@ def test_depth_hint_says_sigils_bind_per_commit_segment(
     )
 
     per_segment = (
-        'git commit -m "merge main"  # depth-ack review-override && '
+        'git commit -m "merge main"  # depth-ack review-override\n'
         "git commit --amend --no-edit  # depth-ack review-override"
     )
     assert _run_hook(per_segment, repo, home).returncode == 0, (
         "the shape the note now prescribes must actually work"
     )
+
+    # Independent oracle: Bash executes BOTH lines.  The hook parser accepting
+    # the string alone cannot establish that, because a `# ... &&` form would
+    # silently comment out the second command in a real shell.
+    (repo / ".git" / "MERGE_HEAD").unlink()
+    actual = subprocess.run(
+        ["bash", "-c", per_segment], cwd=repo, capture_output=True, text=True, timeout=30
+    )
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    reflog = subprocess.run(
+        ["git", "reflog", "-2", "--format=%gs"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert reflog[0].startswith("commit (amend):")
+    assert reflog[1].startswith("commit:")
+
+
+def test_depth_hint_covers_the_prospective_content_of_dash_a(repo: Path, home: Path) -> None:
+    """The note must not license depth-ack after inspecting only the index: -a
+    adds tracked working-tree edits at commit time, beyond that snapshot."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    _mark(repo, home)  # records substantial, non-adversarial marker depth
+    (repo / "f.py").write_text("local tracked edit\n")
+    _begin_merge(repo)
+    res = _run_hook('git commit -a -m "merge main"', repo, home)
+    assert res.returncode == 2
+    assert "prospective commit" in res.stderr
+    assert "tracked working-tree changes selected by -a" in res.stderr
+
+
+def test_depth_hint_covers_a_squash_merge(repo: Path, home: Path) -> None:
+    """`git merge --squash` leaves reviewed content staged and SQUASH_MSG present,
+    but does not create MERGE_HEAD; it needs the same advisory explanation."""
+    _restage(repo, {".claude/agents/reviewer.md": "You are a reviewer.\n"})
+    (repo / ".git" / "SQUASH_MSG").write_text("Squashed commit\n")
+    res = _run_hook('git commit -m "squash merge"', repo, home)
+    assert res.returncode == 2
+    assert "git integration sentinel is present" in res.stderr
+    assert "squash merge" in res.stderr

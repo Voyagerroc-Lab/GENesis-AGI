@@ -628,7 +628,10 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
         raw = out.stdout.strip()
         git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
         merging = (
-            any((git_dir / n).exists() for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"))
+            any(
+                (git_dir / n).exists()
+                for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG")
+            )
             or (git_dir / "rebase-merge").exists()
             or (git_dir / "rebase-apply").exists()
         )
@@ -638,7 +641,7 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
         return ""
     if gate == "depth":
         return (
-            "\n\nNOTE: a git sequencer sentinel is present — a merge, rebase, "
+            "\n\nNOTE: a git integration sentinel is present — a merge, squash merge, rebase, "
             "cherry-pick or revert is in progress. Content that operation brought "
             "in counts toward substantiality exactly like code you wrote (via the "
             "staged diff on a normal commit, via the recorded marker level on an "
@@ -648,7 +651,9 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             "only content that arrived already reviewed on its own PR is somebody "
             "else's audited work. A cherry-pick, a revert, and every conflict "
             "resolution are YOURS and still need the audit — ack only once you "
-            "have checked there is no local delta in the staged set.\n"
+            "have inspected the prospective commit for local content: the staged "
+            "set for an index-only commit, plus tracked working-tree changes selected "
+            "by -a and any pathspec-selected content.\n"
             "The ack clears THIS gate only. If the operation also left the review "
             "marker no longer binding the staged diff — usual for a merge, but NOT "
             "if you re-marked afterwards — the review-current gate blocks next and "
