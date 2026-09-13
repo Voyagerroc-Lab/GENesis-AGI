@@ -1231,7 +1231,18 @@ class TestCheckInlineReviewFindings:
 
     # Every path this class anchors a finding on. Pinned as IN the PR's diff
     # by the autouse fixture below.
+    #
+    # THE LANE THIS LIST IMPLIES IS LOAD-BEARING, so it is declared rather than
+    # inherited. These tests assert the SCORE ARITHMETIC (two P2s = 1.0 blocks),
+    # which is only true at the critical threshold — and until the lane stopped
+    # consulting `_scope_tag`, this class reached `critical` BY ACCIDENT, because
+    # `src/genesis/router.py` matched the `*route*` name glob. That glob is gone
+    # (it also claimed the LLM router and the reflection output router), so the
+    # critical lane is now asserted on purpose via a migration path. Without this
+    # line the class silently drops to `standard` and the scoring tests stop
+    # testing what they name.
     _FINDING_PATHS = [
+        "src/genesis/db/migrations/0001_lane_anchor.py",
         "src/benign.py",
         "src/genesis/foo.py",
         "src/genesis/a.py",
@@ -4723,27 +4734,44 @@ class TestPerLaneThreshold:
         # …and the downstream consumers therefore re-read.
         assert guard_module._pr_changed_files("100") == ["src/new.py"]
 
-    def test_the_force_arm_does_NOT_bind_and_that_is_written_down(
+    def test_the_force_arm_DROPS_the_memo_rather_than_binding_it(
         self, guard_module, monkeypatch
     ):
-        """`# stale-review-override` returns before the binder, so the lane and the
-        off-diff scoping downstream still run on the pin gate's unbound list.
+        """`# stale-review-override` returns before the binder, so it must DROP the
+        pin gate's cached file list instead of leaving it for the inline scan.
 
-        Pinned as a KNOWN, DOCUMENTED limit rather than left implicit, because the
-        in-code comment now states this scope and a comment nothing checks is how
-        the previous, wider claim ("everything downstream") survived. If someone
-        later binds on the force arm too, this test fails and they update the
-        comment in the same change.
+        The first version of this change left the memo intact and argued the risk
+        was covered because a later head's files are a SUPERSET, so the lane could
+        only tighten. A reviewer refuted that: a force-push, or a commit that
+        deletes or renames a path, yields a list that is not a superset — and this
+        arm takes no `--match-head-commit` bind, so nothing downstream catches the
+        mismatch either. A finding on a file only the new head touches would be
+        discarded as off-diff.
+
+        Asserting the RE-READ, not just the absent bind: the earlier assertion
+        (`_PR_FILES_CACHE_HEAD is None`) passed both before and after the fix,
+        since the force arm never sets a head either way.
         """
         monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
         guard_module._reset_pr_files_cache()
-        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", lambda *a, **k: ["src/a.py"])
+        reads = []
+
+        def _fake(pr_num, repo=None):
+            reads.append(pr_num)
+            return ["src/old.py"] if len(reads) == 1 else ["src/new.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
         monkeypatch.setattr(guard_module, "_hook_surface_override_check", lambda *a, **k: (False, ""))
 
-        assert guard_module._pr_changed_files("100") == ["src/a.py"]
+        # The pin-receipt gate's read, before the override arm runs.
+        assert guard_module._pr_changed_files("100") == ["src/old.py"]
+
         blocked, _msg, head = guard_module._check_codex_reviewed_head("100", force=True)
-        assert (blocked, head) == (False, None)
-        assert guard_module._PR_FILES_CACHE_HEAD is None, (
-            "the force arm returns before the binder — if that changes, the scope "
-            "comment at the binding call site must change with it"
+        assert (blocked, head) == (False, None), "the force arm still returns unbound"
+
+        # The inline scan downstream must NOT see the pre-override list.
+        assert guard_module._pr_changed_files("100") == ["src/new.py"], (
+            "the force arm must drop the memo so the finding scan re-reads — "
+            "leaving it is the superset assumption that a force-push breaks"
         )
+        assert len(reads) == 2

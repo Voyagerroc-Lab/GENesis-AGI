@@ -677,34 +677,27 @@ def test_lane_route_and_migration_DIRECTORIES_are_critical():
     assert _rs.classify_lane(["src/genesis/db/migrations/0001_x.py"], hook_surface=False) == "critical"
 
 
-def test_lane_keeps_the_api_and_migrations_tags_that_MEASURED_clean():
-    """The explicit vocabulary AUGMENTS the inherited tags; it does not replace
-    them, and this test is the lock on that.
+def test_the_lane_consults_no_scope_tag():
+    """The lane reads path boundaries, never `_scope_tag`. Structural lock.
 
-    A draft of this change did replace them, on the reasoning that the taxonomy
-    does not describe this repo. That is true of `auth` (98% false positive) and
-    `prompts` (100% false negative) — the two the audit actually indicted — and
-    FALSE of `api` and `migrations`, which it measured clean at 57 and 101 files.
-    Dropping them silently narrowed the critical lane: `*controller*`, `*route*`,
-    `*endpoint*` and `*/api/*` reach HTTP surfaces no literal prefix or basename
-    in this module enumerates.
+    Three rounds of findings on `_is_lane_critical_path` were one question asked
+    of a NAME pattern: "is this an HTTP surface". `*route*` cannot answer it —
+    it matched `routing/router.py` (the LLM router) and
+    `reflection/output_router.py` while missing a root-level `api/` directory,
+    because `*/api/*` needs a preceding path component.
 
-    Note what did NOT catch it. The 40-PR lane distribution was unchanged at 30.0%
-    critical, because none of those 40 touched such a file — the same percentage
-    over different membership. Only a constructed case found it, which is the
-    argument for having one. And a constructed case was not enough either: a later
-    ENUMERATION found four more route surfaces that every example here missed, so
-    `test_every_route_defining_module_is_critical` is the real lock on this class.
+    Re-admitting a tag is the obvious economy the next reader will reach for, and
+    it reads as a smaller change than it is. This test is what stops it: the tag
+    that would be re-admitted demonstrably classifies a non-HTTP module, so the
+    two assertions below cannot both hold while the lane consults tags.
     """
-    assert _rs._scope_tag("src/genesis/router.py") == "api", (
-        "precondition: this path is reached by the inherited glob and by nothing "
-        "explicit in this module, which is what makes it evidence"
+    assert _rs._scope_tag("src/genesis/routing/router.py") == "api", (
+        "precondition: the inherited glob still claims this non-HTTP module, "
+        "or this test no longer demonstrates why the lane ignores tags"
     )
-    assert not any(
-        "src/genesis/router.py".startswith(p) for p in _rs._LANE_CRITICAL_PREFIXES
-    ), "precondition: no explicit prefix covers it"
-    assert os.path.basename("src/genesis/router.py") not in _rs._LANE_CRITICAL_BASENAMES
-    assert _rs.classify_lane(["src/genesis/router.py"], hook_surface=False) == "critical"
+    assert _rs.classify_lane(["src/genesis/routing/router.py"], hook_surface=False) == (
+        "standard"
+    )
 
 
 def test_every_route_defining_module_is_critical():
@@ -742,6 +735,64 @@ def test_every_route_defining_module_is_critical():
         f"{len(misses)} of {len(routed)} route-defining modules sit outside the "
         f"critical lane, which the gate's own message promises covers API "
         f"surfaces: {misses}"
+    )
+
+
+def test_no_non_HTTP_module_is_dragged_into_critical():
+    """The OTHER direction, which the enumeration above is structurally blind to.
+
+    `test_every_route_defining_module_is_critical` measures misses. It cannot see
+    over-classification, so it stayed green across a round in which the `*route*`
+    NAME glob pulled 7 non-HTTP modules into the strictest lane — the LLM router,
+    the dispatch router, the reflection output router. A reviewer found that; this
+    suite could not, because a rate measured on one side of a tradeoff is half a
+    measurement.
+
+    The pair is the point: misses above, false positives here. A future rule that
+    widens the critical set by name rather than by boundary fails one or the other.
+    """
+    root = Path(__file__).resolve().parents[2]
+    pat = re.compile(r"^\s*@\w+\.route\(|Blueprint\(|add_url_rule\(", re.M)
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "*.py"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert len(tracked) > 500, "precondition: ls-files returned a plausible population"
+
+    offenders = []
+    for f in tracked:
+        if f.startswith("tests/"):
+            continue
+        if _rs.classify_lane([f], hook_surface=False) != "critical":
+            continue
+        text = (root / f).read_text(errors="ignore")
+        if pat.search(text):
+            continue  # a real HTTP surface — belongs there
+        # Schema, CI and credential surfaces are critical for reasons that have
+        # nothing to do with routes; they are named by boundary, so exempt them by
+        # the SAME boundary rather than by guessing from the filename.
+        if f.startswith(
+            (
+                ".github/",
+                "src/genesis/db/migrations/",
+                "src/genesis/db/data_migrations/",
+                "src/genesis/dashboard/routes/",
+                "src/genesis/hosting/",
+            )
+        ):
+            continue
+        if os.path.basename(f) in _rs._LANE_CRITICAL_BASENAMES:
+            continue
+        if os.path.basename(f).startswith(_rs._LANE_CRITICAL_BASENAME_PREFIXES):
+            continue
+        offenders.append(f)
+
+    assert not offenders, (
+        f"{len(offenders)} module(s) reach the critical lane without defining an "
+        f"HTTP route or sitting on a declared consequence boundary — the "
+        f"over-classification shape: {offenders}"
     )
 
 

@@ -4878,6 +4878,24 @@ def _check_codex_reviewed_head(
         # see it"). Skipping evidence on a fresh review would let a hook-surface PR
         # RETARGETED to a non-default base merge with no base-bound review. A fresh
         # head-review is NOT a substitute for base-bound evidence here.
+        # The force arm returns WITHOUT establishing a head, so it never reaches
+        # the binder below — and the inline gate downstream keys on a DIFFERENT
+        # sigil (`# review-override`), so it still runs, against whatever file
+        # list the pin-receipt gate cached earlier.
+        #
+        # An earlier version of this change left that alone and argued the risk
+        # was covered because a later head's file list is a SUPERSET, so it could
+        # only tighten the lane. THAT IS FALSE, and a reviewer was right to say
+        # so: a force-push, or a commit that deletes or renames a path, produces a
+        # list that is not a superset. A finding on a file only the new head
+        # touches would then be discarded as off-diff, or a newly-critical change
+        # would keep the old wider threshold — and this arm takes no
+        # `--match-head-commit` bind, so nothing downstream catches it either.
+        #
+        # Dropping the memo is the whole fix: the consumers re-read, against the
+        # head that is actually current when they ask. It costs one
+        # `pulls/N/files` call on an override path that is rare by construction.
+        _reset_pr_files_cache()
         blocked, msg = _hook_surface_override_check(pr_num, repo=repo)
         if blocked:
             return True, msg, None
@@ -4900,14 +4918,12 @@ def _check_codex_reviewed_head(
     # lane and the off-diff finding scoping run after this point and must judge the
     # head this gate verifies and `--match-head-commit` then binds.
     #
-    # SCOPE, stated because the earlier wording said "everything downstream" and
-    # that was false: the `force` arm above returns before reaching here, and
-    # `# stale-review-override` waives only THIS gate — the inline gate downstream
-    # keys on the separate `# review-override` sigil, so it still runs, on the
-    # pin gate's unbound list. Binding there too would cost a `gh` read on a path
-    # whose whole point is to skip reads; the compensating control is that a
-    # superset of files can only make the lane STRICTER, and the merge is still
-    # bound by `--match-head-commit`.
+    # SCOPE: the `force` arm above returns before reaching here. It does NOT
+    # simply skip this — it DROPS the memo instead, so its consumers re-read.
+    # An earlier version left the memo intact there and justified it with "a
+    # later head's files are a superset, so the lane can only tighten"; that
+    # reasoning was wrong (a force-push or a delete/rename breaks it) and the
+    # correction lives at that arm.
     _bind_pr_files_cache_head(head)
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:

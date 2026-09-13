@@ -3142,7 +3142,9 @@ The review-findings gate specifically:
 
    So on a CRITICAL change two P2s still block exactly as before; on ordinary
    code it now takes four. MEASURED over the 40 most recently merged PRs:
-   critical 32.5%, standard 22.5%, light 45.0%. The lane comes from
+   critical 35.0%, standard 20.0%, light 45.0% (a SLIDING window — see the
+   classifier docstring; re-running will not reproduce it, and a difference is
+   the merge queue moving, not a regression). The lane comes from
    `review_scope.classify_lane`, which FAILS CLOSED to `critical` on an
    unreadable file list — the lane relaxes a threshold, so the safe default is
    the one that relaxes nothing.

@@ -690,21 +690,35 @@ _LANE_CRITICAL_PREFIXES = (
 )
 
 
-#: The two INHERITED tags that MEASURED CLEAN, kept as a critical input rather
-#: than re-expressed above. An earlier draft of this change replaced the whole tag
-#: vocabulary, which silently NARROWED the lane: `_SCOPE_PATTERNS`' api globs
-#: (`*controller*`, `*route*`, `*endpoint*`, `*/api/*`) reach real HTTP surfaces —
-#: `src/genesis/router.py` among them — that no explicit prefix or basename above
-#: catches. A gate test caught it; the 40-PR distribution did NOT, because none of
-#: those 40 happened to touch such a file, and critical held at 30.0% with
-#: different membership.
-#:
-#: The audit that motivated replacing the taxonomy indicted `auth` (98% false
-#: positive, matching `*session*` across CC-session machinery) and `prompts` (100%
-#: false negative). It found `api` (57 files) and `migrations` (101) CLEAN. So the
-#: correct change was to AUGMENT these two, not to delete them along with the
-#: broken ones — the explicit vocabulary above covers exactly what they miss.
-_LANE_CRITICAL_TAGS = frozenset({"api", "migrations"})
+# THE LANE CONSULTS NO `_scope_tag` VALUE AT ALL, and the third attempt at this
+# is the reason. The history is kept because each attempt looked correct:
+#
+#   1. Inherit `_DOMAIN_SENSITIVE_TAGS` wholesale -> seven defects, listed above.
+#   2. Replace the taxonomy entirely -> silently NARROWED the lane, because the
+#      `api` globs (`*controller*`, `*route*`, `*endpoint*`, `*/api/*`) reached
+#      HTTP surfaces no explicit rule here named.
+#   3. Re-admit `api` + `migrations`, the two the audit measured CLEAN -> BOTH
+#      over- and under-classifies. `*route*` is a NAME pattern, so it dragged in
+#      7 non-HTTP modules (`routing/router.py` is the LLM router;
+#      `reflection/output_router.py` routes reflection output), while `*/api/*`
+#      and `*/migrations/*` need a preceding path component, so a ROOT-level
+#      `api/` or `migrations/` directory would read `standard`.
+#
+# The audit behind attempt 3 said `api` was "57 files, clean". That was a COUNT,
+# checked by eye; it never asked whether those files were HTTP surfaces, which is
+# the same error the `auth` tag was indicted for (98% matching on `*session*`).
+#
+# MEASURED before deleting, both directions, which is what attempt 3 lacked:
+# dropping the tags leaves 58 of 58 route-defining modules in `critical` — zero
+# misses, because the prefixes and basenames above already cover them — and
+# removes all 7 over-classifications. This repo has no root-level `api/` or
+# `migrations/` directory, so that half costs nothing either. The tags were pure
+# cost by the time they were measured on both sides.
+#
+# So: a NAME pattern cannot answer "is this an HTTP surface". A path boundary can,
+# and `test_every_route_defining_module_is_critical` /
+# `test_no_non_HTTP_module_is_dragged_into_critical` hold both directions of that
+# claim against the tracked population rather than against remembered examples.
 
 #: Exact paths and basename shapes that are consequence surfaces wherever they sit.
 #: `_blueprint.py` is here rather than in the prefixes because it is a route
@@ -731,15 +745,14 @@ _LANE_PROSE_STEM_EXTS = _LANE_PROSE_EXTS | {".txt", ""}
 def _is_lane_critical_path(path: str) -> bool:
     """Is this path a consequence surface — somewhere it costs a lot to be wrong?
 
-    Written for this repo, and the union of two sources ON PURPOSE: the explicit
-    prefixes/basenames above, plus the two inherited tags that measured clean.
-    Neither alone is the surface — the tags reach `*controller*`/`*route*`/
-    `*endpoint*` shapes no literal list here enumerates, and the literals reach
-    `api.py`, `api_*`, and `data_migrations/`, which the tags provably miss.
+    PATH BOUNDARIES AND BASENAMES ONLY — no `_scope_tag` value is consulted, for
+    the reason set out at the constants above: a NAME pattern cannot answer "is
+    this an HTTP surface", and three rounds of findings on this function were all
+    that question being asked of one.
 
-    A path matching neither is ordinary, which is the safe direction: the lane
-    only ever RELAXES a threshold below critical, so a surface nobody thought of
-    is reviewed at the standard bar rather than the widest one.
+    A path matching nothing here is ordinary, which is the safe direction: the
+    lane only ever RELAXES a threshold below critical, so a surface nobody thought
+    of is reviewed at the standard bar rather than the widest one.
 
     NOT here, deliberately: destructive capability, external egress and financial
     logic. Each is named in the lane's design as critical and none has a path
@@ -749,8 +762,6 @@ def _is_lane_critical_path(path: str) -> bool:
     what the instruction files this change also edits already say.
     """
     if any(path.startswith(prefix) for prefix in _LANE_CRITICAL_PREFIXES):
-        return True
-    if _scope_tag(path) in _LANE_CRITICAL_TAGS:
         return True
     base = os.path.basename(path)
     if base in _LANE_CRITICAL_BASENAMES:
@@ -786,9 +797,18 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     read the change (a failed API call reaches us as ``[]``), and a change nobody
     can see is treated as consequential rather than waved through.
 
-    MEASURED over the 40 most recently merged PRs (2026-09-13): critical 32.5%,
-    standard 22.5%, light 45.0%. The bar, set before measuring, was that critical
+    MEASURED over the 40 most recently merged PRs (2026-09-13): critical 35.0%,
+    standard 20.0%, light 45.0%. The bar, set before measuring, was that critical
     stay at or under 50% — a lane that calls everything critical decides nothing.
+
+    THE DENOMINATOR MOVES, so re-running this will not reproduce the figure and a
+    difference is not evidence of a regression. "The 40 most recently merged" is a
+    sliding window: the same probe read 32.5 / 22.5 / 45.0 an hour earlier, and the
+    2.5-point shift was entirely two PRs merging INTO the window (one of them
+    hook-surface, hence critical) — the classifier returned an identical lane for
+    every PR common to both runs. To compare classifiers, hold the PR set fixed and
+    diff the per-PR ASSIGNMENTS; comparing two totals taken at different times
+    measures the merge queue, not the code.
 
     Against THE VERSION THIS REPLACES — the committed tag-based classifier, which
     measures 30.0 / 60.0 / 10.0 over the same 40 PRs — TWO movements account for
