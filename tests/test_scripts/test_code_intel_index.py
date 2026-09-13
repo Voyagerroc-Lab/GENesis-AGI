@@ -119,12 +119,16 @@ def _fake_cgroup_env(tmp_path: Path, *levels: int) -> dict[str, str]:
 
 
 def _fake_cgroup_v1_env(
-    tmp_path: Path, *levels: int, hybrid_v2: bool = False
+    tmp_path: Path,
+    *levels: int,
+    hybrid_v2: bool = False,
+    mount_name: str = "memory",
+    mount_root: str = "/",
 ) -> dict[str, str]:
     """Build a v1 memory-controller hierarchy, root first and leaf last."""
     tag = "-".join(str(x) for x in levels) or "default"
     root = tmp_path / f"cg-v1-{tag}"
-    mount = root / "memory"
+    mount = root / mount_name
     rel_parts = [f"level{i}" for i in range(1, len(levels))]
     d = mount
     for i, val in enumerate(levels):
@@ -133,14 +137,28 @@ def _fake_cgroup_v1_env(
         d.mkdir(parents=True, exist_ok=True)
         (d / "memory.limit_in_bytes").write_text(f"{val}\n", encoding="utf-8")
     selfcg = tmp_path / f"selfcgroup-v1-{tag}"
-    rel = "/" + "/".join(rel_parts)
+    visible_root = mount_root.rstrip("/")
+    rel = visible_root + "/" + "/".join(rel_parts)
+    rel = rel.rstrip("/") or "/"
     lines = ["8:cpu,cpuacct:/ignored", f"5:memory,blkio:{rel}"]
     if hybrid_v2:
         lines.append("0::/unified-without-memory-controller")
     selfcg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mountinfo = tmp_path / f"mountinfo-v1-{tag}"
+    def _mountinfo_escape(value: str) -> str:
+        return (value.replace("\\", "\\134").replace(" ", "\\040")
+                .replace("\t", "\\011").replace("\n", "\\012"))
+
+    mountinfo.write_text(
+        f"31 24 0:27 {_mountinfo_escape(mount_root)}"
+        f" {_mountinfo_escape(str(mount))} rw,nosuid,nodev,noexec,relatime"
+        " - cgroup cgroup rw,blkio,memory\n",
+        encoding="utf-8",
+    )
     return {
         "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
         "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+        "CODE_INTEL_FAKE_CGROUP_MOUNTINFO": str(mountinfo),
     }
 
 
@@ -199,6 +217,21 @@ def test_nonexistent_repo_errors(tmp_path):
     assert res.returncode == 1
 
 
+def test_invalid_arguments_do_not_require_cgroup_discovery(tmp_path):
+    """Argument errors are reported before any irrelevant resource probing."""
+    res = _run_entry(
+        tmp_path,
+        tmp_path / "nope",
+        path=_SYSTEM_PATH,
+        env_extra={
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(tmp_path / "missing-self-cgroup"),
+        },
+    )
+    assert res.returncode == 1
+    assert "repo path missing" in res.stdout
+    assert "cgroup" not in res.stderr.lower()
+
+
 def test_bad_tool_arg_errors(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "everything", path=_SYSTEM_PATH)
@@ -217,6 +250,22 @@ def test_disable_env_skips_everything(tmp_path):
     assert not log.exists()
 
 
+def test_disable_does_not_require_cgroup_discovery(tmp_path):
+    """The escape hatch must work even when cgroup metadata is unavailable."""
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        path=_SYSTEM_PATH,
+        env_extra={
+            "CODE_INTEL_INDEX_DISABLE": "1",
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(tmp_path / "missing-self-cgroup"),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert "disabled" in res.stdout
+
+
 # ── 1. worktree skip ──────────────────────────────────────────────────────
 
 
@@ -228,6 +277,21 @@ def test_worktree_git_file_never_indexed(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "worktree" in res.stdout
     assert not log.exists()  # zero index processes spawned — the core proof
+
+
+def test_worktree_skip_does_not_require_cgroup_discovery(tmp_path):
+    """A path that cannot launch an index must not inspect resource limits."""
+    repo = _make_repo(tmp_path, worktree=True)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        path=_SYSTEM_PATH,
+        env_extra={
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(tmp_path / "missing-self-cgroup"),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert "worktree" in res.stdout
 
 
 def test_main_repo_runs_both_tools(tmp_path):
@@ -353,6 +417,26 @@ def test_lock_skip_rc_override(tmp_path):
                          env_extra={"CODE_INTEL_INDEX_LOCK_SKIP_RC": "75"})
     assert res.returncode == 75, res.stderr
     assert not log.exists()
+
+
+def test_lock_skip_does_not_require_cgroup_discovery(tmp_path):
+    """A held lock keeps its runner retry code even if cgroup data is absent."""
+    repo = _make_repo(tmp_path)
+    lock_file = _lock_file_for(tmp_path, repo)
+    with open(lock_file, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        res = _run_entry(
+            tmp_path,
+            repo,
+            "cbm",
+            path=_SYSTEM_PATH,
+            env_extra={
+                "CODE_INTEL_INDEX_LOCK_SKIP_RC": "75",
+                "CODE_INTEL_FAKE_CGROUP_SELF": str(tmp_path / "missing-self-cgroup"),
+            },
+        )
+    assert res.returncode == 75, res.stderr
+    assert "lock held" in res.stdout
 
 
 def test_parallel_double_invocation_exactly_one_runs(tmp_path):
@@ -683,6 +767,31 @@ def test_cap_walks_v1_memory_controller_hierarchy(tmp_path):
     assert "MemoryMax=1024M" in slog.read_text()
 
 
+def test_cap_resolves_comounted_v1_mount_and_mount_root(tmp_path):
+    """v1 membership is mapped through mountinfo, never a conventional path."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    env = _fake_cgroup_v1_env(
+        tmp_path,
+        32 * 1024**3,
+        3 * 1024**3,
+        mount_name="controllers/cpu memory",
+        mount_root="/namespace-root",
+    )
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=env,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=1024M" in slog.read_text()
+
+
 def test_cap_uses_v1_memory_controller_on_a_hybrid_host(tmp_path):
     """A controller-less unified entry must not mask the v1 memory hierarchy."""
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
@@ -911,7 +1020,7 @@ def _derive_mem_max(limit_bytes: str | None, tmp_path, *ancestors: str) -> str:
     """
     src = _ENTRYPOINT.read_text()
     start = src.index("_CI_MEM_TARGET_MB=")
-    end = src.index('if [ -n "${CODE_INTEL_INDEX_MEMORY_MAX:-}" ]', start)
+    end = src.index("\nIO_WEIGHT=", start)
     body = src[start:end]
 
     root = tmp_path / "cg"

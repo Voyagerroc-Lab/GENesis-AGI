@@ -159,6 +159,7 @@ _derive_mem_max() {
     # shape, different controller.
     local root="${CODE_INTEL_FAKE_CGROUP_ROOT:-/sys/fs/cgroup}"
     local selfcg="${CODE_INTEL_FAKE_CGROUP_SELF:-/proc/self/cgroup}"
+    local mountinfo="${CODE_INTEL_FAKE_CGROUP_MOUNTINFO:-/proc/self/mountinfo}"
     if [ ! -r "$selfcg" ]; then
         echo "ERROR: cannot determine the process cgroup; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
         return 1
@@ -180,9 +181,58 @@ _derive_mem_max() {
         esac
     done < "$selfcg" 2>/dev/null
 
+    case "$v1_rel" in *" (deleted)") v1_rel="${v1_rel% (deleted)}" ;; esac
+    case "$v2_rel" in *" (deleted)") v2_rel="${v2_rel% (deleted)}" ;; esac
+
     local mount="" filename="" version=""
     if [ -n "$v1_rel" ]; then
-        mount="$root/memory"; rel="$v1_rel"
+        if [ ! -r "$mountinfo" ]; then
+            echo "ERROR: cannot resolve the v1 memory-controller mount; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+        fi
+        local mi_line mi_left mi_right mi_root mi_point mi_type mi_opts
+        local -a mi_left_fields mi_right_fields
+        while IFS= read -r mi_line || [ -n "$mi_line" ]; do
+            case "$mi_line" in *" - "*) ;; *) continue ;; esac
+            mi_left="${mi_line%% - *}"
+            mi_right="${mi_line#* - }"
+            # Fields 4 and 5 are the filesystem root and mount point; fields
+            # after the separator begin with type, source, and super-options.
+            # Kernel whitespace/backslash escapes keep each pathname one field.
+            read -r -a mi_left_fields <<< "$mi_left"
+            [ "${#mi_left_fields[@]}" -ge 6 ] || continue
+            mi_root="${mi_left_fields[3]}"; mi_point="${mi_left_fields[4]}"
+            read -r -a mi_right_fields <<< "$mi_right"
+            [ "${#mi_right_fields[@]}" -ge 3 ] || continue
+            mi_type="${mi_right_fields[0]}"; mi_opts="${mi_right_fields[2]}"
+            [ "$mi_type" = "cgroup" ] || continue
+            case ",$mi_opts," in *,memory,*) ;; *) continue ;; esac
+            mi_root="${mi_root//\\040/ }"; mi_root="${mi_root//\\011/$'\t'}"
+            mi_root="${mi_root//\\012/$'\n'}"; mi_root="${mi_root//\\134/\\}"
+            mi_point="${mi_point//\\040/ }"; mi_point="${mi_point//\\011/$'\t'}"
+            mi_point="${mi_point//\\012/$'\n'}"; mi_point="${mi_point//\\134/\\}"
+            case "$mi_root" in /*) ;; *) continue ;; esac
+            case "$mi_point" in /*) ;; *) continue ;; esac
+            case "$v1_rel" in /*) ;; *) continue ;; esac
+            case "/${mi_root#/}/" in *"/../"*|*"/./"*) continue ;; esac
+            case "/${mi_point#/}/" in *"/../"*|*"/./"*) continue ;; esac
+            if [ "$mi_root" = "/" ]; then
+                rel="$v1_rel"
+            elif [ "$v1_rel" = "$mi_root" ]; then
+                rel="/"
+            else
+                case "$v1_rel" in
+                    "$mi_root"/*) rel="${v1_rel#"$mi_root"}" ;;
+                    *) continue ;;
+                esac
+            fi
+            mount="$mi_point"
+            break
+        done < "$mountinfo" 2>/dev/null
+        if [ -z "$mount" ]; then
+            echo "ERROR: cannot resolve the v1 memory-controller mount; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+        fi
         filename="memory.limit_in_bytes"; version="v1"
     elif [ -n "$v2_rel" ]; then
         mount="$root"; rel="$v2_rel"; filename="memory.max"; version="v2"
@@ -298,11 +348,6 @@ _derive_mem_max() {
     printf '%sM\n' "$cap"
 }
 
-if [ -n "${CODE_INTEL_INDEX_MEMORY_MAX:-}" ]; then
-    MEM_MAX="$CODE_INTEL_INDEX_MEMORY_MAX"
-elif ! MEM_MAX="$(_derive_mem_max)"; then
-    exit 1
-fi
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
@@ -381,6 +426,16 @@ if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; the
     fi
 else
     _log "WARNING: flock or lock file unavailable ($LOCK_FILE) — proceeding UNLOCKED"
+fi
+
+# Discover the automatic cap only once an invocation is certain to launch an
+# index. Disabled, invalid, worktree, and lock-held paths intentionally do no
+# work and must retain their own exit semantics even if cgroup metadata is
+# unavailable. An explicit operator override still bypasses discovery.
+if [ -n "${CODE_INTEL_INDEX_MEMORY_MAX:-}" ]; then
+    MEM_MAX="$CODE_INTEL_INDEX_MEMORY_MAX"
+elif ! MEM_MAX="$(_derive_mem_max)"; then
+    exit 1
 fi
 
 # ── 3. Resource-capped runner ───────────────────────────────────────────
