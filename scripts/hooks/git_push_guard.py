@@ -4116,9 +4116,19 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
     question on a single merge — the pin-receipt gate, the lane, and the inline
     findings' off-diff scoping — and the first of those runs unconditionally
     before the other two, so without a cache one merge paid for the same
-    ``pulls/N/files`` read more than once. The answer cannot change mid-hook: a
-    merge is bound to one head by ``--match-head-commit``, and a hook process
-    lives for one command. Cleared between tests by ``_reset_pr_files_cache``.
+    ``pulls/N/files`` read more than once. Cleared between tests by
+    ``_reset_pr_files_cache``.
+
+    THE MEMO IS BOUND TO A HEAD, via ``_bind_pr_files_cache_head``. An earlier
+    version of this docstring argued the answer "cannot change mid-hook, because a
+    merge is bound to one head by ``--match-head-commit``". That was wrong, and the
+    correction is worth keeping: ``--match-head-commit`` constrains the MERGE, it
+    does not make an already-fetched ``pulls/N/files`` response describe that SHA.
+    The pin-receipt gate populates this memo BEFORE the freshness gate reads the
+    head, so a push landing in between left the lane and the off-diff scoping
+    judging the previous head's file set while the merge bound the new one — the
+    findings on files only the new head touches discounted as off-diff, and the
+    lane computed from a diff nobody was merging.
     """
     cache_key = (pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))
     if cache_key in _PR_FILES_CACHE:
@@ -4150,9 +4160,47 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
 _PR_FILES_CACHE: dict[tuple[str, str | None, str | None], list[str] | None] = {}
 
 
+#: The head ``_PR_FILES_CACHE``'s entries describe, or None before any head has been
+#: established. Not part of the key: the memo holds at most one head's answers at a
+#: time, and a key would let two heads' file sets coexist — which is the state this
+#: exists to make unrepresentable.
+_PR_FILES_CACHE_HEAD: str | None = None
+
+
+def _bind_pr_files_cache_head(head: str) -> None:
+    """Bind the changed-file memo to *head*, dropping it if it described another.
+
+    Called from the single point where a head becomes authoritative (the freshness
+    gate, once it has read ``headRefOid``), so no downstream consumer has to
+    remember to invalidate: establishing the head IS the invalidation. A consumer
+    added later inherits the property without knowing it exists, which a
+    "remember to call reset first" convention could not give it.
+
+    Costs one extra ``pulls/N/files`` read per merge in the ordinary case, because
+    the pin-receipt gate's pre-freshness entry is always dropped (it was populated
+    when no head was known). MEASURED at 421-481ms against the merge arm's 45s
+    budget — about 1% — which is the right trade for scoping findings against the
+    head actually being merged.
+
+    WHAT THIS BUYS IS A LOWER BOUND, NOT AN IDENTITY. ``pulls/N/files`` takes no
+    SHA — it answers for whatever the head is at read time — so binding
+    establishes that the file list was fetched AFTER this head was read, not that
+    it describes it. A push inside that window yields a NEWER head's list, which
+    can only add paths and therefore only tighten the lane, and the merge is
+    rejected by ``--match-head-commit`` regardless. The bound is worth having; the
+    identity is not available from the endpoint and is not claimed.
+    """
+    global _PR_FILES_CACHE_HEAD
+    if head != _PR_FILES_CACHE_HEAD:
+        _PR_FILES_CACHE.clear()
+        _PR_FILES_CACHE_HEAD = head
+
+
 def _reset_pr_files_cache() -> None:
-    """Drop the memo. For tests; a hook process never needs it."""
+    """Drop the memo AND its head binding. For tests; a hook process never needs it."""
+    global _PR_FILES_CACHE_HEAD
     _PR_FILES_CACHE.clear()
+    _PR_FILES_CACHE_HEAD = None
 
 
 def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str] | None:
@@ -4846,6 +4894,21 @@ def _check_codex_reviewed_head(
             None,
         )
     head = head.strip().lower()
+    # This is the one place a head becomes authoritative on the NON-FORCED arm, so
+    # it is where the changed-file memo gets bound to it. The pin-receipt gate has
+    # already populated that memo against whatever the head was when IT asked; the
+    # lane and the off-diff finding scoping run after this point and must judge the
+    # head this gate verifies and `--match-head-commit` then binds.
+    #
+    # SCOPE, stated because the earlier wording said "everything downstream" and
+    # that was false: the `force` arm above returns before reaching here, and
+    # `# stale-review-override` waives only THIS gate — the inline gate downstream
+    # keys on the separate `# review-override` sigil, so it still runs, on the
+    # pin gate's unbound list. Binding there too would cost a `gh` read on a path
+    # whose whole point is to skip reads; the compensating control is that a
+    # superset of files can only make the lane STRICTER, and the merge is still
+    # bound by `--match-head-commit`.
+    _bind_pr_files_cache_head(head)
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
         return False, "", head

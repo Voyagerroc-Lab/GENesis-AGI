@@ -649,91 +649,125 @@ def _classify_diff(diff_args: list[str], cwd: str | None) -> str:
 # deep review"; the lane asks "how much does it cost to be wrong". A one-line edit
 # to an enforcement hook is `inline` and `critical` at once.
 #
-# WHY THE SENSITIVE SET IS ENUMERATED HERE rather than reusing
-# `_DOMAIN_SENSITIVE_TAGS`, which is the obvious "cleanup" a later reader will
-# attempt: that set includes `auth`, and in THIS repo the `auth` glob is a
-# name-substring heuristic dominated by `*session*`. MEASURED 2026-09-13 over 3,999
-# tracked files: 59 files tag `auth`, and **58 of them (98%) match on "session"** —
-# CC-session machinery like `session_cache.py` and `genesis_session_context.py`.
-# Exactly one is authentication (`dashboard/auth.py`). Inheriting that set would
-# make 58 session files `critical` for a reason nobody intended. `api` (57 files:
-# dashboard routes, dispatch router) and `migrations` (101) were measured clean.
+# ── the lane's OWN path vocabulary ───────────────────────────────────────────
 #
-# The `auth` glob remains in `_DOMAIN_SENSITIVE_TAGS`, where it already drives the
-# commit depth gate — a separate, pre-existing effect that is tracked on its own
-# issue, not silently changed from here.
-_LANE_SENSITIVE_TAGS = frozenset({"api", "migrations"})
+# WHY THIS DOES NOT REUSE `_scope_tag` / `_DOMAIN_SENSITIVE_TAGS`, which is the
+# obvious economy and was the first two attempts at this lane.
+#
+# `_SCOPE_PATTERNS` is a Rails-flavoured taxonomy mirrored in from another
+# codebase, and it answers a DIFFERENT question: "what kind of file is this, in
+# Rails terms". The lane asks "how much does it cost to be wrong here". Building
+# the second on the first produced SEVEN distinct defects, every finding this
+# change has attracted from either reviewer or from its own author:
+#
+#   `auth` is 98% "session"      58 of 59 tagged files are CC-session machinery
+#   `prompts` is 100% wrong      matches 10 scorers, misses all 84 prompt surfaces
+#   `.txt` admits dependency pins  requirements.txt reached the light lane
+#   `api` globs miss `api.py`    outreach/api.py defines Flask routes, tagged backend
+#   `.markdown`/`.adoc` unreachable  listed, but `_category` calls them code first
+#   extensionless stems unreachable  same cause, found a round later
+#   `data_migrations` tags four ways  one directory, four different tags
+#
+# One class, seven faces: a vocabulary that does not describe this repo. Each fix
+# patched one word of it, and the next round found the next word. So the lane now
+# states its own consequence surfaces explicitly, for THIS repo, and the
+# distribution is re-measured rather than assumed (see `classify_lane`).
+#
+# The narrow, DELIBERATE exception is test/fixture detection below, which stays on
+# `_category`: that half keys on `_TEST_GLOBS`/`_TEST_DIRS`, which are ordinary
+# naming conventions rather than domain vocabulary, and no finding has ever
+# touched it.
 
-# The light lane is PROSE and test material — NOT config. A `.yaml`/`.toml`/
-# `.ini`/`.cfg` reaches `_category() == "docs-config"` through the shared
-# `_is_docs_or_config`, but config is not documentation: `config/
-# desktop_takeover.yaml` arms desktop takeover, `pyproject.toml` and
-# `requirements.txt` pin dependencies. Widening the lane to the whole
-# `docs-config` category handed all of those a 3.0 budget.
-#
-# The repo already learned this once, one layer up: `_HOOK_SURFACE_FILES` in
-# `scripts/hooks/git_push_guard.py` fences `config/protected_paths.yaml` and
-# `config/repo_topology.yaml` by hand, with the comment that "the ordinary
-# substantiality classifier treats YAML as docs/config (review-trivial)". That
-# fence covers ENFORCEMENT config only; this keeps the rest out of `light`
-# rather than extending the relaxation to it.
-# Prose extensions. `.txt` is NOT here: `requirements.txt` and
-# `config/az-pip-constraints.txt` are dependency pins, and admitting every `.txt`
-# handed them a 3.0 budget one line under a comment saying config is not prose.
-# It counts only on a known documentation STEM below — the same split
-# `git_push_guard._is_doc_path` already makes, mirrored so the two cannot
-# disagree about what a `.txt` is.
-#
-# Only `.md` and `.rst` are listed, and that is the REACHABLE set rather than the
-# desirable one. `_category()` runs first and admits only `_is_docs_or_config`'s
-# extensions ({.md .rst .txt .yaml .yml .toml .ini .cfg}); everything else — a
-# `.markdown`, an `.adoc`, an extensionless `README` — is category `code` and
-# never arrives here at all. MEASURED: each of those classifies `standard`.
-# Listing them anyway would advertise coverage this function does not have, which
-# is the same claim-without-a-test shape the rest of this file argues against.
-# The fail direction is the safe one: unrecognised prose is reviewed as ordinary
-# code, never as light.
-_LANE_LIGHT_DOC_EXTS = frozenset({".md", ".rst"})
-_LANE_LIGHT_DOC_STEMS = frozenset(
+#: Directory prefixes whose contents are consequence surfaces. Anchored at a path
+#: boundary — a PREFIX, never a substring — so `src/genesis/db/migrations_notes/`
+#: does not match `.../migrations/` by accident.
+_LANE_CRITICAL_PREFIXES = (
+    ".github/",  # can disable a required check
+    "src/genesis/db/migrations/",  # schema
+    "src/genesis/db/data_migrations/",  # data; MISSED by the inherited glob
+    "src/genesis/dashboard/routes/",  # HTTP surface
+    "src/genesis/hosting/",  # HTTP servers: /genesis/login, /v1/chat/completions
+)
+
+
+#: The two INHERITED tags that MEASURED CLEAN, kept as a critical input rather
+#: than re-expressed above. An earlier draft of this change replaced the whole tag
+#: vocabulary, which silently NARROWED the lane: `_SCOPE_PATTERNS`' api globs
+#: (`*controller*`, `*route*`, `*endpoint*`, `*/api/*`) reach real HTTP surfaces —
+#: `src/genesis/router.py` among them — that no explicit prefix or basename above
+#: catches. A gate test caught it; the 40-PR distribution did NOT, because none of
+#: those 40 happened to touch such a file, and critical held at 30.0% with
+#: different membership.
+#:
+#: The audit that motivated replacing the taxonomy indicted `auth` (98% false
+#: positive, matching `*session*` across CC-session machinery) and `prompts` (100%
+#: false negative). It found `api` (57 files) and `migrations` (101) CLEAN. So the
+#: correct change was to AUGMENT these two, not to delete them along with the
+#: broken ones — the explicit vocabulary above covers exactly what they miss.
+_LANE_CRITICAL_TAGS = frozenset({"api", "migrations"})
+
+#: Exact paths and basename shapes that are consequence surfaces wherever they sit.
+#: `_blueprint.py` is here rather than in the prefixes because it is a route
+#: registrar that lives beside ordinary dashboard code — see the enumeration test.
+_LANE_CRITICAL_BASENAMES = frozenset(
+    {"api.py", "auth.py", "secrets.py", "credentials.py", "_blueprint.py"}
+)
+
+#: Basename PREFIXES, with `.py` required, for the same reason.
+_LANE_CRITICAL_BASENAME_PREFIXES = ("api_", "auth_")
+
+#: Prose. `.txt` is NOT prose on its own — `requirements.txt` and
+#: `config/az-pip-constraints.txt` are dependency pins — so it counts only on a
+#: known documentation STEM, the same split `git_push_guard._is_doc_path` makes.
+#: Unlike the previous version these are matched DIRECTLY rather than behind
+#: `_category`, so every spelling listed is actually reachable.
+_LANE_PROSE_EXTS = frozenset({".md", ".rst", ".markdown", ".adoc"})
+_LANE_PROSE_STEMS = frozenset(
     {"CHANGELOG", "README", "LICENSE", "NOTICE", "COPYING", "AUTHORS", "CONTRIBUTING"}
 )
-_LANE_LIGHT_STEM_EXTS = _LANE_LIGHT_DOC_EXTS | {".txt", "."}
+_LANE_PROSE_STEM_EXTS = _LANE_PROSE_EXTS | {".txt", ""}
 
 
 def _is_lane_critical_path(path: str) -> bool:
-    """Consequence surfaces the inherited `_scope_tag` vocabulary MISSES.
+    """Is this path a consequence surface — somewhere it costs a lot to be wrong?
 
-    `_SCOPE_PATTERNS`' `api` globs are `*controller* *route* *endpoint* */api/*`,
-    which catch this repo's dashboard routes but NOT a module simply named
-    `api.py` or `api_*.py` — those tag `backend`. MEASURED: both
-    `src/genesis/outreach/api.py` (which defines Flask routes) and
-    `az_plugins/genesis/api_health.py` classified `standard`, a false NEGATIVE on
-    the lane's own stated critical set. Closed here BY NAME rather than by
-    widening `_SCOPE_PATTERNS`, whose blast radius is the blocking commit depth
-    gate plus four other consumers.
+    Written for this repo, and the union of two sources ON PURPOSE: the explicit
+    prefixes/basenames above, plus the two inherited tags that measured clean.
+    Neither alone is the surface — the tags reach `*controller*`/`*route*`/
+    `*endpoint*` shapes no literal list here enumerates, and the literals reach
+    `api.py`, `api_*`, and `data_migrations/`, which the tags provably miss.
 
-    `.github/` is also checked here, and again BEFORE the vendored strip in
-    `classify_lane`, for the reason written there.
+    A path matching neither is ordinary, which is the safe direction: the lane
+    only ever RELAXES a threshold below critical, so a surface nobody thought of
+    is reviewed at the standard bar rather than the widest one.
+
+    NOT here, deliberately: destructive capability, external egress and financial
+    logic. Each is named in the lane's design as critical and none has a path
+    definition anywhere in this repo, so including them would mean inventing three
+    taxonomies inside this change. `config/` was briefly in the prefix list for the
+    same impulse and is gone for the same reason — config is ORDINARY, which is
+    what the instruction files this change also edits already say.
     """
-    if path.startswith(".github/"):
+    if any(path.startswith(prefix) for prefix in _LANE_CRITICAL_PREFIXES):
+        return True
+    if _scope_tag(path) in _LANE_CRITICAL_TAGS:
         return True
     base = os.path.basename(path)
-    return base == "api.py" or (base.startswith("api_") and base.endswith(".py"))
+    if base in _LANE_CRITICAL_BASENAMES:
+        return True
+    return base.endswith(".py") and base.startswith(_LANE_CRITICAL_BASENAME_PREFIXES)
 
 
 def _is_lane_light(path: str) -> bool:
     """Prose, tests and fixtures — the material a wider finding budget suits."""
-    category = _category(path)
-    if category in ("test", "fixture"):
+    if _category(path) in ("test", "fixture"):
         return True
-    if category != "docs-config":
-        return False
     base = os.path.basename(path)
     stem, dot, ext = base.rpartition(".")
-    ext = f".{ext.lower()}" if dot else "."
-    if (stem if dot else base).upper() in _LANE_LIGHT_DOC_STEMS:
-        return ext in _LANE_LIGHT_STEM_EXTS
-    return ext in _LANE_LIGHT_DOC_EXTS
+    ext = f".{ext.lower()}" if dot else ""
+    if (stem if dot else base).upper() in _LANE_PROSE_STEMS:
+        return ext in _LANE_PROSE_STEM_EXTS
+    return ext in _LANE_PROSE_EXTS
 
 
 def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
@@ -753,8 +787,53 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     can see is treated as consequential rather than waved through.
 
     MEASURED over the 40 most recently merged PRs (2026-09-13): critical 32.5%,
-    standard 57.5%, light 10.0%. The bar, set before measuring, was that critical
+    standard 22.5%, light 45.0%. The bar, set before measuring, was that critical
     stay at or under 50% — a lane that calls everything critical decides nothing.
+
+    Against THE VERSION THIS REPLACES — the committed tag-based classifier, which
+    measures 30.0 / 60.0 / 10.0 over the same 40 PRs — TWO movements account for
+    the difference, both derived per-PR rather than inferred from the totals:
+
+    * **14 PRs moved standard -> light**, every one a PROMPT SURFACE (``SKILL.md``,
+      ``.claude/commands/*.md``, ``src/genesis/skills/**``) — which ``_category``
+      calls ``code`` and this vocabulary reads as prose. That is the intended
+      reading; rule-docs belong in the widest budget. It is also mostly INERT
+      rather than a loosening: 11 of the 14 contain nothing whose findings score
+      at all, because every path in them is a ``git_push_guard._is_doc_path`` and
+      that gate's ``doc_findings`` mode defaults to ``skip``. The 3 that do change
+      behaviour are prose-plus-tests PRs whose TEST findings now clear at 3.0
+      instead of 2.0.
+
+      That inertness is a DEFAULT, not a structural bound. ``doc_findings`` is
+      read from ``merge_gate`` in ``~/.genesis/config/genesis.yaml``, so an install
+      setting ``score`` gets the full 3.0 budget on prompt surfaces — including
+      ``src/genesis/identity/`` and the executor/sentinel prompt directories. This
+      repo's own rule for this shape says an exemption may cite a bound
+      configuration CANNOT change, never a default; so the honest version is that
+      the loosening is bounded on THIS install's settings, and that is the case to
+      think about before widening the prose set further.
+    * **1 PR moved standard -> critical** — #1874, which touches
+      ``src/genesis/hosting/standalone.py``, the module serving ``/genesis/login``.
+      That is the route-surface gap below arriving on a real merged PR rather than
+      only on a constructed one.
+
+    An intermediate, NEVER-COMMITTED draft additionally carried a blanket
+    ``config/`` critical prefix and measured 32.5 / 57.5 / 10.0; dropping that
+    prefix is what moved its one config PR back to standard. That figure is
+    narrative about a draft, not a delta against this diff's base — recorded
+    separately because stating it as "the previous measurement" is exactly the
+    permanent-record error this docstring is otherwise careful about.
+
+    A DISTRIBUTION IS NOT A COVERAGE PROOF, which is the lesson worth keeping:
+    critical sat unchanged across that draft while it had silently stopped
+    classifying ``*route*``/``*controller*``/``*endpoint*`` paths as critical.
+    Same percentage, different membership; only a constructed test case found it.
+    A LATER enumeration found four more the constructed cases also missed — route
+    definitions in ``src/genesis/hosting/`` and ``dashboard/_blueprint.py``, one of
+    them serving ``/genesis/login`` — which is why the lock for that class is an
+    enumeration over every tracked module rather than another example. The
+    always-fix floor still blocks a P1 or a CodeRabbit Critical/Major in every
+    lane regardless of any of this.
     """
     if not paths:
         return "critical"
@@ -770,19 +849,16 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     # block, not after the strip.
     if hook_surface:
         return "critical"
-    if any(p.startswith(".github/") for p in paths):
+    # Consequence surfaces are tested against the FULL path list, not the
+    # vendor-stripped one, for the reason above: a vendor glob must not be able to
+    # hide one. `_is_lane_critical_path` is now the entire critical vocabulary, so
+    # nothing is left below the strip that needs to outrank it.
+    if any(_is_lane_critical_path(p) for p in paths):
         return "critical"
     reviewable = [p for p in paths if not _is_vendored(p)]
     if not reviewable:
         # Vendored-only: a lockfile refresh or a regenerated bundle.
         return "light"
-    # `.github/` is not hook surface, but a change here can disable a required
-    # check as effectively as editing a gate — the rationale already written into
-    # `.github/labeler.yml`'s `ci-config` label.
-    if any(_is_lane_critical_path(p) for p in reviewable):
-        return "critical"
-    if any(_scope_tag(p) in _LANE_SENSITIVE_TAGS for p in reviewable):
-        return "critical"
     if all(_is_lane_light(p) for p in reviewable):
         return "light"
     return "standard"

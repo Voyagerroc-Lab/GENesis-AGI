@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -662,9 +663,125 @@ def test_lane_github_config_is_critical():
     assert _rs.classify_lane([".github/workflows/ci.yml"], hook_surface=False) == "critical"
 
 
-def test_lane_api_and_migrations_are_critical():
+def test_lane_route_and_migration_DIRECTORIES_are_critical():
+    """The explicit PREFIXES, not the tags.
+
+    Renamed from `test_lane_api_and_migrations_are_critical`, which claimed the
+    tags while both of its paths also satisfy `_LANE_CRITICAL_PREFIXES` — so it
+    passed with the tag rule deleted, and a test that cannot say which of two
+    rules it proves is a lock on neither. The tag lock is
+    `test_lane_keeps_the_api_and_migrations_tags_that_MEASURED_clean`, which does
+    go red under that mutation.
+    """
     assert _rs.classify_lane(["src/genesis/dashboard/routes/x.py"], hook_surface=False) == "critical"
     assert _rs.classify_lane(["src/genesis/db/migrations/0001_x.py"], hook_surface=False) == "critical"
+
+
+def test_lane_keeps_the_api_and_migrations_tags_that_MEASURED_clean():
+    """The explicit vocabulary AUGMENTS the inherited tags; it does not replace
+    them, and this test is the lock on that.
+
+    A draft of this change did replace them, on the reasoning that the taxonomy
+    does not describe this repo. That is true of `auth` (98% false positive) and
+    `prompts` (100% false negative) — the two the audit actually indicted — and
+    FALSE of `api` and `migrations`, which it measured clean at 57 and 101 files.
+    Dropping them silently narrowed the critical lane: `*controller*`, `*route*`,
+    `*endpoint*` and `*/api/*` reach HTTP surfaces no literal prefix or basename
+    in this module enumerates.
+
+    Note what did NOT catch it. The 40-PR lane distribution was unchanged at 30.0%
+    critical, because none of those 40 touched such a file — the same percentage
+    over different membership. Only a constructed case found it, which is the
+    argument for having one. And a constructed case was not enough either: a later
+    ENUMERATION found four more route surfaces that every example here missed, so
+    `test_every_route_defining_module_is_critical` is the real lock on this class.
+    """
+    assert _rs._scope_tag("src/genesis/router.py") == "api", (
+        "precondition: this path is reached by the inherited glob and by nothing "
+        "explicit in this module, which is what makes it evidence"
+    )
+    assert not any(
+        "src/genesis/router.py".startswith(p) for p in _rs._LANE_CRITICAL_PREFIXES
+    ), "precondition: no explicit prefix covers it"
+    assert os.path.basename("src/genesis/router.py") not in _rs._LANE_CRITICAL_BASENAMES
+    assert _rs.classify_lane(["src/genesis/router.py"], hook_surface=False) == "critical"
+
+
+def test_every_route_defining_module_is_critical():
+    """The lock for the API class is an ENUMERATION, not another example.
+
+    The lane's own operator message names "API surfaces" as critical. MEASURED
+    2026-09-13 over every tracked `.py`: 54 of 58 route-defining modules reached
+    `critical`, and the four misses were `src/genesis/hosting/{standalone,
+    openclaw/completions,agent_zero/overlay}.py` and `dashboard/_blueprint.py` —
+    `standalone.py:647` serves `/genesis/login`, and it was reachable by neither
+    the `api` tag nor an `api.py`/`auth.py` basename.
+
+    Why this shape: neither of the change's own two methods could produce that
+    finding. The 40-PR distribution reproduced to the decimal across it, and every
+    constructed case passed. A population check is the only thing that fails when
+    a new route surface appears somewhere nobody listed.
+    """
+    root = Path(__file__).resolve().parents[2]
+    pat = re.compile(r"^\s*@\w+\.route\(|Blueprint\(|add_url_rule\(", re.M)
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "*.py"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert len(tracked) > 500, "precondition: ls-files returned a plausible population"
+    routed = [
+        f
+        for f in tracked
+        if not f.startswith("tests/") and pat.search((root / f).read_text(errors="ignore"))
+    ]
+    assert routed, "precondition: the detector finds route definitions at all"
+    misses = [f for f in routed if _rs.classify_lane([f], hook_surface=False) != "critical"]
+    assert not misses, (
+        f"{len(misses)} of {len(routed)} route-defining modules sit outside the "
+        f"critical lane, which the gate's own message promises covers API "
+        f"surfaces: {misses}"
+    )
+
+
+def test_the_prose_vocabulary_mirrors_the_guards_doc_vocabulary():
+    """Third replica of ONE vocabulary; only two of the three were locked.
+
+    `_LANE_PROSE_*` here and `_DOC_*` in `git_push_guard` must agree, and the
+    docstring above says so in prose — which is a convention at a call site that
+    has to remember. `tests/test_session_awareness/test_doc_paths.py` already locks
+    the guard-vs-doc_paths pair the same way; this closes the third edge, so `.adoc`
+    cannot be added to one side while the lane and the doc-findings filter start
+    disagreeing about what prose is.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_gpg_for_prose_parity", _SCRIPTS / "hooks" / "git_push_guard.py"
+    )
+    guard = importlib.util.module_from_spec(spec)
+    sys.modules["_gpg_for_prose_parity"] = guard
+    try:
+        spec.loader.exec_module(guard)
+        assert {e.lstrip(".") for e in _rs._LANE_PROSE_EXTS} == guard._DOC_EXTS
+        assert {s.lower() for s in _rs._LANE_PROSE_STEMS} == guard._DOC_STEMS
+        assert {e.lstrip(".") for e in _rs._LANE_PROSE_STEM_EXTS} == guard._DOC_STEM_EXTS
+    finally:
+        sys.modules.pop("_gpg_for_prose_parity", None)
+
+
+def test_lane_config_is_ORDINARY_not_critical():
+    """`config/` was briefly a critical prefix, on the reasoning that config arms
+    behaviour. Removed: the genuinely arming directory, `config/behavioral_rules/`,
+    is already hook surface and reaches critical that way, while a blanket prefix
+    put routine threshold edits in the strictest lane AND contradicted the
+    instruction-file text this same change adds ("config is NOT prose, so a
+    `.yaml`/`.toml` change is ordinary").
+
+    Destructive-capability, egress and financial paths are the same shape and are
+    likewise out: naming them needs a taxonomy this repo does not yet have.
+    """
+    assert _rs.classify_lane(["config/reflex.yaml"], hook_surface=False) == "standard"
+    assert _rs.classify_lane(["config/github_steward.yaml"], hook_surface=False) == "standard"
 
 
 def test_lane_auth_tag_is_NOT_critical():
@@ -693,6 +810,34 @@ def test_lane_docs_and_tests_only_is_light():
     ) == "light"
 
 
+def test_lane_prompt_surfaces_are_light():
+    """A rule-doc belongs in the widest budget, and this is the one behaviour the
+    vocabulary change actually moved.
+
+    MEASURED over the 40 most recently merged PRs (2026-09-13): 14 moved
+    `standard` -> `light` versus the tag-based draft, and every one is a prompt
+    surface — `_category` calls these `code`, so the inherited classifier put
+    them in `standard` while the plan's own lane table said rule-docs were light.
+    The move is mostly inert rather than a loosening: 11 of the 14 contain
+    nothing whose findings score at all, since every path in them is a
+    `git_push_guard._is_doc_path` and `doc_findings` defaults to `skip`.
+
+    The `_category` assertions are the precondition. Without them this test
+    passes for free the day something reclassifies these as docs, and would stop
+    being evidence that the lane makes its own decision here.
+    """
+    for path in (
+        ".claude/skills/genesis-development/SKILL.md",
+        ".claude/commands/deep-review.md",
+        "src/genesis/skills/voice-master/references/anti-slop.md",
+    ):
+        assert _rs._category(path) == "code", (
+            f"precondition: {path} must still reach _category()=='code', "
+            "or this test no longer shows the lane deciding for itself"
+        )
+        assert _rs.classify_lane([path], hook_surface=False) == "light"
+
+
 def test_lane_one_code_file_among_docs_is_not_light():
     """The light lane is ALL-or-nothing: one real code file disqualifies it."""
     assert _rs.classify_lane(["docs/a.md", "src/genesis/memory/store.py"], hook_surface=False) == (
@@ -717,11 +862,15 @@ def test_lane_dependency_pins_are_NOT_light():
     """`.txt` alone is not prose. `requirements.txt` and
     `config/az-pip-constraints.txt` are dependency pins that reach
     `_category() == "docs-config"`; admitting every `.txt` gave them a 3.0
-    budget one line under a comment saying config is not prose."""
-    assert _rs.classify_lane(["requirements.txt"], hook_surface=False) == "standard"
-    assert _rs.classify_lane(
-        ["config/az-pip-constraints.txt"], hook_surface=False
-    ) == "standard"
+    budget one line under a comment saying config is not prose.
+
+    Each path is asserted against `_is_lane_light` as well as the lane, because a
+    lane assertion alone cannot tell "`.txt` is not prose" from "something else
+    made this non-light". The direct call is the rule actually under test.
+    """
+    for path in ("requirements.txt", "config/az-pip-constraints.txt"):
+        assert not _rs._is_lane_light(path)
+        assert _rs.classify_lane([path], hook_surface=False) == "standard"
 
 
 def test_lane_a_doc_stem_with_txt_is_still_light():
@@ -738,8 +887,15 @@ def test_lane_every_authority_outranks_the_vendored_strip():
     Both spellings measured: each of these is `_is_vendored` via `*/generated/*`
     and each returned `light` while its check sat below the strip. The hook-surface
     one was found first and fixed alone; `.github/` was the same class one line
-    away and a second reviewer had to find it. This test pins BOTH so the next
-    authority added cannot be placed on the wrong side of the strip quietly.
+    away and a second reviewer had to find it.
+
+    These two are the MEASURED regressions, and that is all this test pins. The
+    general property is carried by STRUCTURE, not by these assertions:
+    `_is_lane_critical_path` is the entire critical vocabulary and it is called
+    above the strip, so an authority added inside it inherits the ordering for
+    free. An authority added as a separate `if` AFTER the strip would still slip
+    past, and nothing here can see that — said plainly because the earlier wording
+    credited this test with a guarantee only the structure provides.
     """
     assert _rs._is_vendored("scripts/hooks/generated/x.py"), "precondition: vendored"
     assert _rs._is_vendored(".github/generated/ci.yml"), "precondition: vendored"

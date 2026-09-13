@@ -3096,26 +3096,55 @@ The review-findings gate specifically:
    |---|---|---|
    | `critical` | **1.0** | enforcement-hook surface, `.github/**`, `api`/`migrations`-tagged paths, and modules named `api.py` / `api_*.py` |
    | `standard` | **2.0** | ordinary runtime code |
-   | `light` | **3.0** | PROSE / tests / fixtures only, or vendored-only |
+   | `light` | **3.0** | PROSE (including prompt surfaces) / tests / fixtures only, or vendored-only |
 
    **`light` is PROSE, not `docs-config`.** A `.yaml`/`.toml`/`.ini`/`.cfg`
    reaches `_category() == "docs-config"` through the shared classifier, but
    config is not documentation — `config/desktop_takeover.yaml` arms desktop
    takeover and `pyproject.toml` pins dependencies, so both are `standard`. The
-   light lane is `.md`/`.rst`, plus `.txt` ONLY on a known documentation stem
-   (`CHANGELOG.txt` yes, `requirements.txt` no — the same split
-   `_is_doc_path` makes), plus tests and fixtures
-   (`review_scope._is_lane_light`). Unrecognised prose spellings — `.adoc`, an
-   extensionless `README` — are category `code` and classify `standard`: the
-   fail direction is the safe one, and the light set lists only what can
-   actually reach it rather than what would be nice.
+   light lane is `.md`/`.rst`/`.markdown`/`.adoc`, plus `.txt` and the
+   extensionless form ONLY on a known documentation stem (`CHANGELOG.txt` and a
+   bare `LICENSE` yes, `requirements.txt` no — the same split `_is_doc_path`
+   makes), plus tests and fixtures (`review_scope._is_lane_light`). Those
+   spellings are matched DIRECTLY rather than behind `_category`, because
+   `_category` calls `.adoc` and an extensionless `README` **code** — so an
+   earlier draft that listed them behind it advertised prose formats nothing
+   could reach.
+
+   **A PROMPT SURFACE is prose here.** `_category` calls `SKILL.md`,
+   `.claude/commands/*.md` and `src/genesis/skills/**/*.md` *code*; the lane
+   reads them as what they are. MEASURED: this is the single biggest effect of
+   the lane's own vocabulary — 14 of 40 recent PRs classify `light` where the
+   inherited tagger said `standard` — and it is mostly INERT, because 11 of those
+   14 touch nothing whose findings score at all (every path is an `_is_doc_path`
+   and `doc_findings` defaults to `skip`). Where it bites is a prose-plus-TESTS
+   PR, whose test findings then clear at 3.0.
 
    So on a CRITICAL change two P2s still block exactly as before; on ordinary
    code it now takes four. MEASURED over the 40 most recently merged PRs:
-   critical 32.5%, standard 57.5%, light 10.0%. The lane comes from
+   critical 32.5%, standard 22.5%, light 45.0%. The lane comes from
    `review_scope.classify_lane`, which FAILS CLOSED to `critical` on an
    unreadable file list — the lane relaxes a threshold, so the safe default is
    the one that relaxes nothing.
+
+   ⚠ **A stable distribution is NOT a coverage proof, and neither is a passing
+   example.** Building this lane produced the same miss twice, each time caught by
+   a method the previous one could not reach:
+
+   * A draft held critical at an unchanged 30.0% while having silently stopped
+     classifying `*route*`/`*controller*`/`*endpoint*` paths as critical — same
+     percentage, different membership, because none of the 40 sampled PRs touched
+     such a file. A **constructed test case** found it; the measurement could not.
+   * Four route-defining modules — `src/genesis/hosting/**` and
+     `dashboard/_blueprint.py`, one serving `/genesis/login` — were still outside
+     the lane after that fix. Every constructed case passed and the distribution
+     reproduced to the decimal. Only an **enumeration over every tracked module**
+     found them, which is why that class is now locked by a population check
+     rather than by more examples.
+
+   When you change what feeds a classifier: diff the per-item ASSIGNMENTS rather
+   than the totals, and lock a category by enumerating its population rather than
+   by naming the members you happened to think of.
 
    **`auth` is deliberately NOT a critical input**, though it sits in
    `_DOMAIN_SENSITIVE_TAGS` and drives the depth gate. Its glob is

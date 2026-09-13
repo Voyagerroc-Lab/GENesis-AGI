@@ -4648,3 +4648,102 @@ class TestPerLaneThreshold:
         b = guard_module._pr_changed_files("100")
         assert a == b == ["src/genesis/memory/store.py"]
         assert len(calls) == 1, f"expected one underlying read, got {len(calls)}"
+
+    def test_the_memo_is_dropped_when_a_head_is_established(self, guard_module, monkeypatch):
+        """The pin-receipt gate populates the memo BEFORE the freshness gate reads
+        the head. If a push lands in between, everything downstream — the lane and
+        the off-diff finding scoping — would otherwise judge the PREVIOUS head's
+        file set while `--match-head-commit` binds the new one.
+
+        `--match-head-commit` does not rescue this: it constrains the MERGE, it
+        does not make an already-fetched `pulls/N/files` response describe that
+        SHA. So establishing a head drops a memo bound to a different one.
+        """
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        reads = []
+
+        def _fake(pr_num, repo=None):
+            reads.append(pr_num)
+            # Second read simulates the new head touching a different file.
+            return ["src/old.py"] if len(reads) == 1 else ["src/new.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
+
+        assert guard_module._pr_changed_files("100") == ["src/old.py"]
+        guard_module._bind_pr_files_cache_head("a" * 40)
+        assert guard_module._pr_changed_files("100") == ["src/new.py"], (
+            "a memo populated before any head was known must not survive the "
+            "freshness gate establishing one"
+        )
+        assert len(reads) == 2
+
+        # Guard the guard: binding the SAME head again is not a reason to re-read,
+        # or the memo would buy nothing on the arm that actually uses it.
+        guard_module._bind_pr_files_cache_head("a" * 40)
+        assert guard_module._pr_changed_files("100") == ["src/new.py"]
+        assert len(reads) == 2, "re-binding an unchanged head must not invalidate"
+
+    def test_the_freshness_gate_is_what_binds_the_memo(self, guard_module, monkeypatch):
+        """The binding's whole design is its PLACEMENT, and placement was the one
+        property nothing tested.
+
+        MEASURED: with `_bind_pr_files_cache_head(head)` deleted from
+        `_check_codex_reviewed_head`, 463 tests in this file and
+        `test_review_scope.py` still passed — including the test directly above,
+        which calls the helper itself and so cannot see the call site go away.
+        A reviewer found that by mutation; the suite could not.
+
+        So this test drives the REAL gate and asserts the binding happened as a
+        side effect, which is the only form that fails when the wiring is removed.
+        """
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        reads = []
+
+        def _fake(pr_num, repo=None):
+            reads.append(pr_num)
+            return ["src/old.py"] if len(reads) == 1 else ["src/new.py"]
+
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", _fake)
+        monkeypatch.setattr(guard_module, "_pr_head_sha", lambda *a, **k: "b" * 40)
+        monkeypatch.setattr(guard_module, "_latest_codex_reviewed_sha", lambda *a, **k: "b" * 40)
+
+        # The pin-receipt gate's read, before any head is known.
+        assert guard_module._pr_changed_files("100") == ["src/old.py"]
+        assert guard_module._PR_FILES_CACHE_HEAD is None
+
+        blocked, _msg, head = guard_module._check_codex_reviewed_head("100")
+        assert (blocked, head) == (False, "b" * 40)
+        assert guard_module._PR_FILES_CACHE_HEAD == "b" * 40, (
+            "the freshness gate must be what establishes the head — this fails if "
+            "the _bind_pr_files_cache_head call is removed from it, which is "
+            "precisely what no other test in this suite can detect"
+        )
+        # …and the downstream consumers therefore re-read.
+        assert guard_module._pr_changed_files("100") == ["src/new.py"]
+
+    def test_the_force_arm_does_NOT_bind_and_that_is_written_down(
+        self, guard_module, monkeypatch
+    ):
+        """`# stale-review-override` returns before the binder, so the lane and the
+        off-diff scoping downstream still run on the pin gate's unbound list.
+
+        Pinned as a KNOWN, DOCUMENTED limit rather than left implicit, because the
+        in-code comment now states this scope and a comment nothing checks is how
+        the previous, wider claim ("everything downstream") survived. If someone
+        later binds on the force arm too, this test fails and they update the
+        comment in the same change.
+        """
+        monkeypatch.delenv("_TEST_GH_PR_FILES", raising=False)
+        guard_module._reset_pr_files_cache()
+        monkeypatch.setattr(guard_module, "_pr_changed_files_uncached", lambda *a, **k: ["src/a.py"])
+        monkeypatch.setattr(guard_module, "_hook_surface_override_check", lambda *a, **k: (False, ""))
+
+        assert guard_module._pr_changed_files("100") == ["src/a.py"]
+        blocked, _msg, head = guard_module._check_codex_reviewed_head("100", force=True)
+        assert (blocked, head) == (False, None)
+        assert guard_module._PR_FILES_CACHE_HEAD is None, (
+            "the force arm returns before the binder — if that changes, the scope "
+            "comment at the binding call site must change with it"
+        )
