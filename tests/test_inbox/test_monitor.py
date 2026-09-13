@@ -506,6 +506,228 @@ async def test_temporarily_unreadable_pending_batch_recovers_when_readable(
 
 
 @pytest.mark.asyncio
+async def test_unmarked_processing_batch_is_rederived_immediately_after_restart(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """A crash after the pre-dispatch claim must not wait for the 2h expiry."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    f = inbox_dir / "links.md"
+    content = "https://example.com/article"
+    f.write_text(content)
+    await inbox_items.create(
+        db,
+        id="claimed",
+        file_path=str(f),
+        content_hash=compute_hash(f),
+        status="processing",
+        # Must be younger than expire_stuck_processing's two-hour fallback;
+        # otherwise the fixture never exercises immediate restart recovery.
+        created_at=datetime.now(UTC).isoformat(),
+        drop_id="drop",
+        batch_items=content,
+    )
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 1
+    assert (await inbox_items.get_by_id(db, "claimed"))["status"] == "completed"
+    mock_invoker.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_batch_is_marked_dispatching_before_cc_invocation(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """The durable phase marker must precede the external CC side effect."""
+    from genesis.db.crud import inbox_items
+
+    observed_markers = []
+
+    async def _observe_marker(_invocation):
+        cursor = await db.execute(
+            "SELECT status, error_message FROM inbox_items ORDER BY rowid DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        observed_markers.append((row["status"], row["error_message"]))
+        return _success_output()
+
+    mock_invoker.run.side_effect = _observe_marker
+    (inbox_dir / "links.md").write_text("https://example.com/article")
+
+    assert (await monitor.check_once()).batches_dispatched == 1
+    assert len(observed_markers) == 1
+    status, marker = observed_markers[0]
+    assert status == "processing"
+    assert marker.startswith(inbox_items.DISPATCHING_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_modification_does_not_reset_exhausted_item_retry_budget(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """An exhausted URL stays terminal while genuinely new content is evaluated."""
+    from dataclasses import replace
+
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    monitor._config = replace(
+        monitor._config,
+        evaluation_cooldown_seconds=0,
+        items_per_eval=1,
+    )
+    f = inbox_dir / "links.md"
+    evaluated = "https://example.com/already-done"
+    exhausted = "https://example.com/permanently-dead"
+    new = "https://example.com/new-item"
+    f.write_text(f"{evaluated}\n{exhausted}\n")
+    old_hash = compute_hash(f)
+
+    await inbox_items.create(
+        db,
+        id="completed",
+        file_path=str(f),
+        content_hash=old_hash,
+        status="completed",
+        created_at="2026-03-10T11:00:00+00:00",
+    )
+    await inbox_items.update_status(
+        db,
+        "completed",
+        status="completed",
+        processed_at="2026-03-10T11:00:00+00:00",
+        evaluated_content=evaluated,
+    )
+    # Three old exhausted siblings used to trip the file-wide storm guard and
+    # suppress even genuinely new work. Item-local terminal handling must keep
+    # all three out of the new drop without imposing a time window.
+    exhausted_ids = []
+    for index in range(monitor._config.max_retries):
+        row_id = f"exhausted-{index}"
+        exhausted_ids.append(row_id)
+        await inbox_items.create(
+            db,
+            id=row_id,
+            file_path=str(f),
+            content_hash=old_hash,
+            status="failed",
+            created_at=f"2020-01-0{index + 1}T00:00:00+00:00",
+            batch_items=exhausted,
+        )
+        await inbox_items.update_status(
+            db,
+            row_id,
+            status="failed",
+            processed_at=f"2020-01-0{index + 1}T00:01:00+00:00",
+            error_message="partial_url_failure",
+            retry_count=monitor._config.max_retries,
+        )
+
+    mock_invoker.run.return_value = _success_output(
+        f"# Inbox Evaluation\n**Source:** {new}\n" + "x" * 300
+    )
+    f.write_text(f"{evaluated}\n{exhausted}\n{new}\n")
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 1
+    invocation = mock_invoker.run.await_args.args[0]
+    assert new in invocation.prompt
+    assert exhausted not in invocation.prompt
+    rows = await db.execute_fetchall(
+        "SELECT id, status, retry_count FROM inbox_items WHERE file_path = ?",
+        (str(f),),
+    )
+    exhausted_rows = [row for row in rows if row["retry_count"] >= monitor._config.max_retries]
+    assert [row["id"] for row in exhausted_rows] == exhausted_ids
+
+
+@pytest.mark.asyncio
+async def test_modern_terminal_content_does_not_hide_opaque_legacy_storm(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Mixed rollout history keeps the legacy guard for unidentifiable rows."""
+    from dataclasses import replace
+
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    monitor._config = replace(monitor._config, evaluation_cooldown_seconds=0)
+    f = inbox_dir / "links.md"
+    modern_terminal = "https://example.com/known-dead"
+    f.write_text(modern_terminal)
+    old_hash = compute_hash(f)
+    now_iso = datetime.now(UTC).isoformat()
+    await inbox_items.create(
+        db, id="modern", file_path=str(f), content_hash=old_hash,
+        status="failed", created_at=now_iso, batch_items=modern_terminal,
+        error_message="partial_url_failure", retry_count=monitor._config.max_retries,
+    )
+    for index in range(monitor._config.max_retries):
+        await inbox_items.create(
+            db, id=f"legacy-{index}", file_path=str(f), content_hash=old_hash,
+            status="failed", created_at=now_iso,
+            error_message="partial_url_failure", retry_count=monitor._config.max_retries,
+        )
+
+    f.write_text(f"{modern_terminal}\nhttps://example.com/new")
+    result = await monitor.check_once()
+
+    assert result.items_modified == 1
+    assert result.batches_dispatched == 0
+    mock_invoker.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modern_terminal_siblings_do_not_block_distinct_retriable_batch(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Item-local terminal state must also apply in the auto-retry lane."""
+    from dataclasses import replace
+
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.scanner import compute_hash
+
+    monitor._config = replace(monitor._config, items_per_eval=1)
+    f = inbox_dir / "links.md"
+    terminal_urls = [f"https://example.com/dead-{index}" for index in range(3)]
+    retriable = "https://example.com/retry-me"
+    f.write_text("\n".join([*terminal_urls, retriable]))
+    content_hash = compute_hash(f)
+    now_iso = datetime.now(UTC).isoformat()
+    for index, url in enumerate(terminal_urls):
+        await inbox_items.create(
+            db, id=f"terminal-{index}", file_path=str(f),
+            content_hash=content_hash, status="failed", created_at=now_iso,
+            batch_items=inbox_items.serialize_batch_items([url]),
+            error_message="partial_url_failure",
+            retry_count=monitor._config.max_retries,
+        )
+    await inbox_items.create(
+        db, id="retriable", file_path=str(f), content_hash=content_hash,
+        status="failed", created_at=now_iso,
+        batch_items=inbox_items.serialize_batch_items([retriable]),
+        error_message="partial_url_failure", retry_count=1,
+    )
+    mock_invoker.run.return_value = _success_output(
+        f"# Inbox Evaluation\n**Source:** <{retriable}>\n" + "x" * 300
+    )
+
+    result = await monitor.check_once()
+
+    assert result.items_retried == 1
+    assert result.batches_dispatched == 1
+    invocation = mock_invoker.run.await_args.args[0]
+    assert retriable in invocation.prompt
+    assert all(url not in invocation.prompt for url in terminal_urls)
+    row = await inbox_items.get_by_id(db, "retriable")
+    assert row["status"] == "completed"
+    assert row["retry_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_pending_recovery_abandons_path_replaced_by_directory(
     monitor, inbox_dir, db, mock_invoker
 ):
@@ -718,7 +940,9 @@ async def test_pending_recovery_rebuilds_a_missing_durable_payload(
 
     rebuilt = await inbox_items.get_by_id(db, "malformed")
     assert rebuilt["status"] == "completed"
-    assert rebuilt["batch_items"] == "https://example.com/current"
+    assert inbox_items.batch_items_for_dispatch(rebuilt["batch_items"]) == (
+        "https://example.com/current"
+    )
     assert rebuilt["drop_id"] != "drop"
     assert rebuilt["retry_count"] == 2
     assert result.items_new == 1
@@ -1217,6 +1441,23 @@ async def test_build_prompt_enumerates_urls(monitor, inbox_dir):
     assert "1. https://example.com" in prompt
     assert "2. search.app/abc" in prompt
     assert "### Content:" in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_enumerates_lossless_terminal_url(monitor, inbox_dir):
+    """The evaluator must be told to cite the same identity the gate checks."""
+    from genesis.inbox.types import InboxItem
+
+    url = "https://en.wikipedia.org/wiki/Foo_(bar)?q=bang!"
+    item = InboxItem(
+        id="terminal-url",
+        file_path=str(inbox_dir / "links.md"),
+        content=url,
+        content_hash="abc",
+        detected_at="2026-09-12",
+    )
+
+    assert f"1. {url}" in monitor._build_prompt([item])
 
 
 @pytest.mark.asyncio
@@ -2624,6 +2865,174 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
     assert len(rows3) == 1
     assert rows3[0]["id"] == rows1[0]["id"]
     assert rows3[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corrupt_payload",
+    [
+        "inbox-items-v2:not-json",
+        b"inbox-items-v2:not-json",
+    ],
+)
+async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+    corrupt_payload,
+):
+    """Corrupt structured storage is not the legacy full-file fallback."""
+    from genesis.db.crud import inbox_items
+
+    path, _ = await _seed_parked_row(
+        db,
+        inbox_dir,
+        request_id="req-corrupt",
+        filename="corrupt.md",
+        content="first item\n\nsecond item",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET batch_items = ?, retry_count = ? WHERE id = ?",
+        (
+            corrupt_payload,
+            monitor._config.max_retries - 1,
+            "row-req-corrupt",
+        ),
+    )
+    await db.commit()
+
+    new_pending = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="fresh approval required",
+        approval_request_id="req-fresh",
+    )
+    dispatcher = _make_wired_dispatcher(
+        decision=new_pending,
+        approval_by_id={
+            "req-corrupt": {"id": "req-corrupt", "status": "approved"},
+        },
+    )
+    dispatcher.approval_gate.mark_consumed = AsyncMock(return_value=True)
+    monitor._autonomous_dispatcher = dispatcher
+
+    result = await monitor.check_once()
+
+    assert result.batches_dispatched == 0
+    mock_invoker.run.assert_not_awaited()
+    corrupt = await inbox_items.get_by_id(db, "row-req-corrupt")
+    assert corrupt["status"] == "processing"
+    assert corrupt["error_message"] == (
+        f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
+    )
+    assert corrupt["retry_count"] == monitor._config.max_retries - 1
+    assert inbox_items.batch_items_for_dispatch(corrupt["batch_items"]) == "first item"
+    dispatcher.approval_gate.mark_consumed.assert_awaited_once_with("req-corrupt")
+    rows = await db.execute_fetchall(
+        "SELECT id, status, error_message, batch_items FROM inbox_items "
+        "WHERE file_path = ? ORDER BY rowid",
+        (str(path),),
+    )
+    assert len(rows) == 2
+    assert all(row["status"] == "processing" for row in rows)
+    assert all(
+        row["error_message"] == f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
+        for row in rows
+    )
+    assert [
+        inbox_items.batch_items_for_dispatch(row["batch_items"])
+        for row in rows
+    ] == ["first item", "second item"]
+
+
+@pytest.mark.asyncio
+async def test_corrupt_parked_batch_retries_after_healthy_sibling_completes(
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    db,
+):
+    """A completed sibling must not strand a corrupt batch at the same hash."""
+    from genesis.db.crud import inbox_items
+
+    path, content_hash = await _seed_parked_row(
+        db,
+        inbox_dir,
+        request_id="req-siblings",
+        filename="corrupt-siblings.md",
+        content="first item\n\nsecond item",
+    )
+    corrupt_id = "row-req-siblings"
+    healthy_id = "row-req-siblings-healthy"
+    await db.execute(
+        "UPDATE inbox_items SET batch_items = ?, drop_id = ? WHERE id = ?",
+        (
+            f"{inbox_items.BATCH_ITEMS_V2_PREFIX}not-json",
+            "drop-siblings",
+            corrupt_id,
+        ),
+    )
+    await inbox_items.create(
+        db,
+        id=healthy_id,
+        file_path=str(path),
+        content_hash=content_hash,
+        status="processing",
+        created_at="2026-03-10T11:00:01+00:00",
+        drop_id="drop-siblings",
+        batch_items=inbox_items.serialize_batch_items(["second item"]),
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-siblings",
+    )
+    await db.commit()
+
+    approved = AutonomousDispatchDecision(
+        mode="cli_approved",
+        reason="CLI fallback approved",
+        approval_request_id="req-siblings",
+    )
+    first_dispatcher = _make_wired_dispatcher(
+        decision=approved,
+        approval_by_id={
+            "req-siblings": {"id": "req-siblings", "status": "approved"},
+        },
+    )
+    first_dispatcher.approval_gate.mark_consumed = AsyncMock(return_value=True)
+    monitor._autonomous_dispatcher = first_dispatcher
+    mock_invoker.run.return_value = _success_output("healthy sibling evaluated")
+
+    first = await monitor.check_once()
+
+    assert first.batches_dispatched == 1
+    mock_invoker.run.assert_awaited_once()
+    assert "second item" in mock_invoker.run.await_args.args[0].prompt
+    assert "first item" not in mock_invoker.run.await_args.args[0].prompt
+    corrupt = await inbox_items.get_by_id(db, corrupt_id)
+    healthy = await inbox_items.get_by_id(db, healthy_id)
+    assert corrupt["status"] == "failed"
+    assert corrupt["error_message"] == "batch_items_corrupt_restart"
+    assert healthy["status"] == "completed"
+
+    mock_invoker.run.reset_mock()
+    fresh_pending = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="fresh approval required",
+        approval_request_id="req-siblings-fresh",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=fresh_pending,
+    )
+
+    second = await monitor.check_once()
+
+    assert second.items_retried == 1
+    assert second.batches_dispatched == 0
+    mock_invoker.run.assert_not_awaited()
+    recovered = await inbox_items.get_by_id(db, corrupt_id)
+    assert recovered["status"] == "processing"
+    assert recovered["error_message"] == (
+        f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-siblings-fresh"
+    )
+    assert inbox_items.batch_items_for_dispatch(recovered["batch_items"]) == "first item"
 
 
 @pytest.mark.asyncio

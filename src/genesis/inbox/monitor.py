@@ -19,6 +19,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.session_config import SessionConfigBuilder
 from genesis.inbox.scanner import (
+    Item,
     compute_hash,
     detect_changes,
     extract_urls,
@@ -144,7 +145,7 @@ def _has_url_failures(response_text: str, input_content: str) -> bool:
     Only triggers on definitive give-up language, not on error mentions
     that may appear in successful workaround descriptions.
     """
-    urls = _extract_urls(input_content)
+    urls = _extract_coverage_input_urls(input_content)
     if not urls:
         return False
     lower = response_text.lower()
@@ -158,6 +159,40 @@ _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 # ("see {https://example.com/secret-9f2}") must not exempt a live URL from
 # the whole gate.
 _PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
+
+# Coverage has a stricter grammar than general inbox discovery.  The input side
+# preserves every non-whitespace terminal character (ambiguous punctuation must
+# fail closed); the evidence side accepts only the evaluator's required Source
+# field, optionally enclosed in RFC-style angle brackets.
+_COVERAGE_INPUT_URL_RE = re.compile(
+    r"(?:https?://[^\s<>]+)"
+    r"|"
+    r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>]+)",
+    re.IGNORECASE,
+)
+_SOURCE_FIELD_RE = re.compile(
+    r"^\s*\*\*Source:\*\*\s*(?P<source>\S(?:.*\S)?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_coverage_input_urls(text: str) -> list[str]:
+    """Discover input URLs without discarding identity-bearing characters."""
+    return list(dict.fromkeys(match.group(0) for match in _COVERAGE_INPUT_URL_RE.finditer(text)))
+
+
+def _extract_source_urls(response_text: str) -> list[str]:
+    """Parse lossless coverage evidence from required ``**Source:**`` fields."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _SOURCE_FIELD_RE.finditer(response_text):
+        value = match.group("source").strip()
+        if value.startswith("<") and value.endswith(">"):
+            value = value[1:-1]
+        if _COVERAGE_INPUT_URL_RE.fullmatch(value) and value not in seen:
+            seen.add(value)
+            urls.append(value)
+    return urls
 
 def _coverage_identity(url: str) -> str | None:
     """Return the URL identity used by the citation-coverage gate.
@@ -186,9 +221,10 @@ def _coverage_identity(url: str) -> str | None:
         authority += f":{port}"
 
     identity = authority + parsed.path.rstrip("/")
-    if parsed.query:
+    pre_fragment = url.split("#", 1)[0]
+    if "?" in pre_fragment:
         identity += f"?{parsed.query}"
-    if parsed.fragment:
+    if "#" in url:
         identity += f"#{parsed.fragment}"
     return identity
 
@@ -208,12 +244,12 @@ def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
     also avoids the prior substring matcher's growing boundary rules and keeps
     the scan linear in the number of extracted URLs.
     """
-    urls = _extract_urls(input_content)
+    urls = _extract_coverage_input_urls(input_content)
     if not urls:
         return []
     response_identities = {
         identity
-        for cited in _extract_urls(response_text)
+        for cited in _extract_source_urls(response_text)
         if (identity := _coverage_identity(cited)) is not None
     }
     return [
@@ -761,7 +797,39 @@ class InboxMonitor:
             # every URL (Genesis-85). Legacy rows (pre-migration, no
             # batch_items) fall back to the full re-read. The hash guard above
             # ensures the file is unchanged since parking.
-            batch_text = str(row.get("batch_items") or "") or content
+            stored_batch = row.get("batch_items")
+            batch_text = inbox_items.batch_items_for_dispatch(stored_batch)
+            if batch_text is None:
+                # A v2 marker proves this row was meant to contain structured
+                # item boundaries. Corruption must never fall through to the
+                # legacy full-file replay, which would dispatch the whole file
+                # once per parked batch. Invalidate and re-derive under a fresh
+                # approval instead.
+                await inbox_items.update_status(
+                    self._db,
+                    row_id,
+                    status="failed",
+                    # This remains retryable.  ``approval_invalidated:`` rows
+                    # are intentionally excluded from the retry lane, which
+                    # would strand corruption whenever a healthy sibling at
+                    # the same file hash completes in this scan.
+                    error_message="batch_items_corrupt_restart",
+                    processed_at=now_iso,
+                    # Corrupt storage is not an evaluation attempt. Preserve
+                    # the budget so a max-1 parked row cannot become terminal
+                    # at the unchanged file hash and block re-derivation.
+                    retry_count=int(row.get("retry_count") or 0),
+                )
+                if request_id:
+                    await self._consume_approval(request_id)
+                logger.error(
+                    "Inbox row %s has corrupt versioned batch_items; "
+                    "queued for safe re-derivation",
+                    row_id,
+                )
+                continue
+            if not batch_text:
+                batch_text = content
             resume_items.append(
                 InboxItem(
                     id=row_id,
@@ -989,6 +1057,7 @@ class InboxMonitor:
                 # Only retry-EXHAUSTED rows count as persistent failure; a
                 # first miss on each of several distinct URLs is not a storm.
                 min_retry_count=self._config.max_retries,
+                opaque_only=True,
             )
             if url_fail_count >= self._config.max_retries:
                 logger.warning(
@@ -1065,8 +1134,13 @@ class InboxMonitor:
                 self._db,
                 str(f),
             )
-            if prev_content:
-                delta = _compute_new_content(prev_content, content)
+            handled_batches = await inbox_items.get_handled_batch_content(
+                self._db,
+                str(f),
+                max_retries=self._config.max_retries,
+            )
+            if prev_content or handled_batches:
+                delta = _compute_new_content(prev_content or "", content, handled_batches)
                 is_empty_delta = not delta.strip()
                 eval_content = delta
             else:
@@ -1136,36 +1210,26 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
-            # Storm guard: a file whose evaluations keep failing on dead URLs
-            # must not re-queue a drop every scan. Mirror the new-file and retry
-            # paths (which already gate here) — the modified path was the one
-            # site missing it. Instead of dropping, write a completing row to
-            # ADVANCE the known hash (stopping re-detection), exactly like the
-            # empty-delta branch above.
-            # NOTE (deliberate): any rows already PARKED for this file were
-            # superseded above and get NO replacement here — the parked delta
-            # is exactly the repeatedly-failing content the guard exists to
-            # stop re-chewing. The now-orphaned request is cancelled quietly
-            # by the orphan guard; the WARNING below is the operator trace.
-            url_fail_count = await inbox_items.count_url_failures(
+            # Legacy terminal URL-failure rows may predate ``batch_items``.
+            # Their failed content has no recoverable identity, so item-local
+            # suppression cannot distinguish it from genuinely new content.
+            # Preserve the bounded file-level storm guard only for that opaque
+            # legacy class; modern terminal rows are handled above by exact
+            # batch content and must not suppress unrelated new items.
+            opaque_url_fail_count = await inbox_items.count_url_failures(
                 self._db,
                 str(f),
                 since_hours=48,
-                # Only retry-EXHAUSTED rows count as persistent failure; a
-                # first miss on each of several distinct URLs is not a storm.
                 min_retry_count=self._config.max_retries,
+                opaque_only=True,
             )
-            if url_fail_count >= self._config.max_retries:
+            if opaque_url_fail_count >= self._config.max_retries:
                 logger.warning(
-                    "Retry storm: %s has %d URL failures in 48h, skipping modification",
+                    "Retry storm: %s has %d opaque legacy URL failures in "
+                    "48h, skipping modification",
                     f,
-                    url_fail_count,
+                    opaque_url_fail_count,
                 )
-                # Park the file WITHOUT claiming its content was evaluated.
-                # A "completed" row with no response_path reads as success to
-                # every consumer while nothing ever looked at the content; a
-                # retry-exhausted "failed" row blocks reprocessing identically
-                # (get_all_known admits it) and tells the truth.
                 await inbox_items.create(
                     self._db,
                     id=item_id,
@@ -1263,6 +1327,10 @@ class InboxMonitor:
                 # Only retry-EXHAUSTED rows count as persistent failure; a
                 # first miss on each of several distinct URLs is not a storm.
                 min_retry_count=self._config.max_retries,
+                # Modern terminal siblings have exact item identities and are
+                # suppressed below. Only opaque legacy history may justify a
+                # file-level guard that blocks this distinct retry candidate.
+                opaque_only=True,
             )
             if url_fail_count >= self._config.max_retries:
                 logger.warning(
@@ -1275,7 +1343,16 @@ class InboxMonitor:
                 self._db,
                 str(f),
             )
-            delta = _compute_new_content(prev_content, content) if prev_content else content
+            handled_batches = await inbox_items.get_handled_batch_content(
+                self._db,
+                str(f),
+                max_retries=self._config.max_retries,
+            )
+            delta = _compute_new_content(
+                prev_content or "",
+                content,
+                handled_batches,
+            ) if prev_content or handled_batches else content
             if not delta.strip():
                 # The failed batch's URLs are no longer in the file (removed) —
                 # nothing to retry. Abandon the stale failed rows so the file
@@ -1309,15 +1386,27 @@ class InboxMonitor:
         ``items_per_eval``, and create one pending row per batch under a shared
         ``drop_id``. Appends one InboxItem per batch to ``pending_items``.
 
-        Each batch's lines are stored verbatim in ``batch_items`` so the
-        approval-resume pass re-dispatches the exact approved delta rather than
-        re-reading the full file. Pre-dispatch restart recovery deliberately
-        does not trust this row set: creation can crash after any row commit, so
-        it re-derives complete outstanding work from source plus baseline.
+        Each batch's logical item texts are stored losslessly through the
+        versioned ``batch_items`` codec so approval resume re-dispatches the
+        exact approved delta rather than re-reading the full file. Pre-dispatch
+        restart recovery deliberately does not trust this row set: creation can
+        crash after any row commit, so it re-derives complete outstanding work
+        from source plus baseline.
         """
         from genesis.db.crud import inbox_items
 
-        items = segment_items(eval_content)
+        # Deduplicate whole logical items, not URLs. The same bare URL pasted
+        # twice is redundant, but two different annotations attached to that
+        # URL are distinct user intent and both must retain their source
+        # context through batching.
+        items: list[Item] = []
+        seen_item_identities: set[str] = set()
+        for candidate in segment_items(eval_content, deduplicate_urls=False):
+            identity = normalize_url_line(candidate.text.strip())
+            if identity in seen_item_identities:
+                continue
+            seen_item_identities.add(identity)
+            items.append(candidate)
         if not items:
             return
         size = max(1, self._config.items_per_eval)
@@ -1334,14 +1423,21 @@ class InboxMonitor:
         )
         drop_id = str(uuid.uuid4())
         for idx, batch in enumerate(batches):
-            batch_text = "\n".join(it.text for it in batch)
+            # Runtime content stays plain, while the durable column carries a
+            # versioned item array. Legacy single-newline storage destroyed the
+            # distinction between a standalone note followed by a URL and an
+            # annotation attached to that URL.
+            batch_text = "\n\n".join(it.text for it in batch)
+            stored_batch = inbox_items.serialize_batch_items(
+                [it.text for it in batch]
+            )
             if idx < len(reusable):
                 row_id = str(reusable[idx]["id"])
                 await inbox_items.reuse_as_pending(
                     self._db,
                     row_id,
                     drop_id=drop_id,
-                    batch_items=batch_text,
+                    batch_items=stored_batch,
                     content_hash=content_hash,
                     created_at=now_iso,
                 )
@@ -1355,7 +1451,7 @@ class InboxMonitor:
                     status="pending",
                     created_at=now_iso,
                     drop_id=drop_id,
-                    batch_items=batch_text,
+                    batch_items=stored_batch,
                 )
             pending_items.append(
                 InboxItem(
@@ -1462,6 +1558,17 @@ class InboxMonitor:
             if outcome != "approved":
                 continue
             for item in items:
+                dispatch_token = str(uuid.uuid4())
+                if not await inbox_items.claim_preapproved_for_dispatch(
+                    self._db,
+                    item.id,
+                    token=dispatch_token,
+                ):
+                    logger.warning(
+                        "Inbox batch %s lost its preapproved dispatch claim; skipping",
+                        item.id[:8],
+                    )
+                    continue
                 if await self._dispatch_one_batch(
                     item,
                     model=model,
@@ -2249,7 +2356,7 @@ class InboxMonitor:
 
         for idx, item in enumerate(items, 1):
             name = Path(item.file_path).name
-            urls = _extract_urls(item.content)
+            urls = _extract_coverage_input_urls(item.content)
             parts.append(f"\n---\n\n## Item {idx}: {name}\n")
             if urls:
                 parts.append(
@@ -2257,13 +2364,14 @@ class InboxMonitor:
                     "and report the result):\n",
                 )
                 parts.append(
-                    "Quote each URL VERBATIM in your evaluation (a "
-                    "`**Source:** <url>` line in that item's section). A "
-                    "mechanical coverage check re-queues the whole item as "
-                    "unevaluated when an input URL appears nowhere in your "
-                    "response — this matters most for shortened links "
-                    "(lnkd.in, share.google) whose target you discuss by "
-                    "title.\n"
+                    "Quote each URL VERBATIM in a dedicated Source field, "
+                    "preferably angle-delimited: `**Source:** "
+                    "<https://example.com/path?q=value!>`. Only Source fields "
+                    "count as mechanical coverage evidence; an incidental URL "
+                    "mention elsewhere does not. Missing or ambiguous evidence "
+                    "re-queues the whole item as unevaluated — this matters "
+                    "most for shortened links (lnkd.in, share.google) whose "
+                    "target you discuss by title.\n"
                 )
                 for i, url in enumerate(urls, 1):
                     parts.append(f"{i}. {url}")
@@ -2280,9 +2388,13 @@ class InboxMonitor:
         return "\n".join(parts)
 
     @staticmethod
-    def _compute_new_content(old_content: str, new_content: str) -> str:
+    def _compute_new_content(
+        old_content: str,
+        new_content: str,
+        handled_batch_content: list[str] | None = None,
+    ) -> str:
         """Return only the lines in new_content that weren't in old_content."""
-        return _compute_new_content(old_content, new_content)
+        return _compute_new_content(old_content, new_content, handled_batch_content)
 
     async def _fire_triage(self, output: Any, user_text: str) -> None:
         """Fire-and-forget triage pipeline. Never crashes inbox processing."""
@@ -2501,46 +2613,62 @@ class InboxMonitor:
         return created
 
 
-def _compute_new_content(old_content: str, new_content: str) -> str:
-    """Return only the lines in new_content that weren't in old_content.
+def _compute_new_content(
+    old_content: str,
+    new_content: str,
+    handled_batch_content: list[str] | None = None,
+) -> str:
+    """Return whole current items containing at least one unhandled line.
 
-    Uses a set of non-empty stripped lines from the old content to identify
-    which lines in the new content are genuinely new. Preserves order and
-    blank lines between new items.
-
-    Lines are compared after URL tracking-param normalization, so the same
-    article re-pasted with different share/tracking params is not treated as
-    new. The original (un-normalized) line is kept in the output for evaluation.
-
-    An elided already-evaluated line leaves a blank-line separator in its
-    place (when new lines surround it), so two new lines that were NOT
-    adjacent in the source never become adjacent in the delta —
-    ``segment_items`` would otherwise attach the first as the second's
-    annotation.
+    Successful baseline lines and retry-exhausted batch lines are both handled
+    identities, but remain semantically distinct in storage.  Segmenting the
+    current file before filtering preserves an existing URL when a new adjacent
+    annotation changes that logical item.  Item boundaries are re-emitted with
+    blank separators so downstream segmentation cannot invent adjacency.
     """
-    old_lines = {
-        normalize_url_line(line.strip()) for line in old_content.splitlines() if line.strip()
+    legacy_lines = {
+        normalize_url_line(line.strip())
+        for line in old_content.splitlines()
+        if line.strip()
     }
-    new_lines = new_content.splitlines()
-    result: list[str] = []
-    elided_since_last = False
-    for line in new_lines:
-        stripped = line.strip()
-        if stripped and normalize_url_line(stripped) not in old_lines:
-            if elided_since_last and result and result[-1].strip():
-                # Mark the discontinuity an elided baselined line leaves.
-                result.append("")
-            elided_since_last = False
-            result.append(line)
-        elif not stripped and result:
-            # Keep blank lines between new items for readability
-            result.append(line)
-        elif stripped:
-            elided_since_last = True
-    # Strip trailing blank lines
-    while result and not result[-1].strip():
-        result.pop()
-    return "\n".join(result)
+    handled_sequences = [
+        tuple(normalize_url_line(line.strip()) for line in block.splitlines())
+        for block in (handled_batch_content or [])
+        if block.strip()
+    ]
+
+    def _is_contiguous_subsequence(
+        needle: tuple[str, ...],
+        haystack: tuple[str, ...],
+    ) -> bool:
+        if not needle or len(needle) > len(haystack):
+            return False
+        width = len(needle)
+        return any(
+            haystack[index : index + width] == needle
+            for index in range(len(haystack) - width + 1)
+        )
+
+    selected: list[str] = []
+    for item in segment_items(new_content, deduplicate_urls=False):
+        identity = tuple(
+            normalize_url_line(line.strip())
+            for line in item.text.splitlines()
+        )
+        handled_as_item = any(
+            _is_contiguous_subsequence(identity, batch)
+            for batch in handled_sequences
+        )
+        # The cumulative historical baseline has no adjacency information.
+        # It can safely recognize standalone notes by their constituent lines
+        # and single-line URL items, but never a multi-line URL item: doing so
+        # would silently collapse annotation ownership.
+        handled_by_legacy_baseline = (
+            item.kind == "note" and all(line in legacy_lines for line in identity)
+        ) or (len(identity) == 1 and identity[0] in legacy_lines)
+        if identity and not handled_as_item and not handled_by_legacy_baseline:
+            selected.append(item.text)
+    return "\n\n".join(selected)
 
 
 def _merge_evaluated_content(

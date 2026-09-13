@@ -211,7 +211,11 @@ class Item:
     urls: list[str] = field(default_factory=list)
 
 
-def segment_items(delta_text: str) -> list[Item]:
+def segment_items(
+    delta_text: str,
+    *,
+    deduplicate_urls: bool = True,
+) -> list[Item]:
     """Split a file's delta into evaluation items.
 
     Rules:
@@ -249,13 +253,14 @@ def segment_items(delta_text: str) -> list[Item]:
         urls = extract_urls(stripped)
         if urls:
             norm = normalize_url_line(stripped)
-            if norm in seen_urls:
+            if deduplicate_urls and norm in seen_urls:
                 # The first occurrence already carries its own context; keep
                 # any annotation above this re-paste rather than losing it
                 # with the duplicate line.
                 _flush_note()
                 continue
-            seen_urls.add(norm)
+            if deduplicate_urls:
+                seen_urls.add(norm)
             # Adjacent prose (no blank line between) is this URL's annotation.
             if note_buf:
                 intent = "\n".join(note_buf).strip()

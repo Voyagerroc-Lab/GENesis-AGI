@@ -14,6 +14,14 @@
   `url_coverage_mode: enforce` to have a miss re-queue the item through the
   existing bounded retry path with the partial response preserved.
 
+  Coverage now counts only dedicated `**Source:**` fields and preserves legal
+  terminal URL characters. Exact retry-exhausted items remain terminal across
+  unrelated edits without suppressing genuinely new siblings. New batch rows
+  store versioned, lossless item boundaries in the existing database column;
+  malformed text or binary values are safely re-derived instead of crashing
+  the monitor or replaying a whole file. Legacy rows whose item boundaries
+  cannot be reconstructed retain the bounded file-level storm guard.
+
   Shadow is the default deliberately. The check is new, and replaying it over
   this install's completed evaluations flags roughly half of older responses —
   which would re-queue them into a retry path that parks a whole file after

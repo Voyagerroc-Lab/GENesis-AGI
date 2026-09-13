@@ -109,7 +109,7 @@ class TestUncoveredUrls:
 
     def test_coverage_ignores_scheme_www_and_trailing_slash(self):
         content = "https://www.example.com/piece/"
-        response = "# Inbox Evaluation\nSee example.com/piece for details."
+        response = "# Inbox Evaluation\n**Source:** example.com/piece"
         assert _uncovered_urls(response, content) == []
 
     def test_a_verbatim_url_keeping_its_trailing_slash_is_covered(self):
@@ -139,10 +139,64 @@ class TestUncoveredUrls:
 
         assert _uncovered_urls(f"**Source:** {cited}", content) == [content]
 
-    def test_a_sentence_period_after_the_url_does_not_break_the_match(self):
+    def test_a_prose_mention_is_not_source_evidence(self):
         content = "https://example.com/piece"
         response = "# Inbox Evaluation\nRead https://example.com/piece. It is good."
+        assert _uncovered_urls(response, content) == [content]
+
+    def test_angle_wrapped_source_is_parsed_losslessly(self):
+        content = "https://example.com/?q=bang!"
+        response = f"# Inbox Evaluation\n**Source:** <{content}>"
         assert _uncovered_urls(response, content) == []
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "https://example.com/path;",
+            "https://example.com/path:",
+            "https://example.com/path,",
+            "https://example.com/path'",
+            "https://example.com/path!",
+            "https://example.com/wiki/Foo_(bar)",
+            "https://[2001:db8::1]:8443/path",
+            "https://example.com/path?q=value!#fragment,",
+        ],
+    )
+    def test_source_field_preserves_identity_bearing_terminal_characters(self, content):
+        assert _uncovered_urls(f"**Source:** <{content}>", content) == []
+
+    def test_source_field_with_trailing_comment_is_ambiguous_and_fails_closed(self):
+        content = "https://example.com/path"
+        response = f"**Source:** {content} (resolved successfully)"
+        assert _uncovered_urls(response, content) == [content]
+
+    @pytest.mark.parametrize("suffix", ["?", "#"])
+    def test_empty_query_or_fragment_delimiter_is_identity_bearing(self, suffix):
+        content = f"https://example.com/path{suffix}"
+        response = "**Source:** <https://example.com/path>"
+        assert _uncovered_urls(response, content) == [content]
+
+    @pytest.mark.parametrize(
+        "content,truncated",
+        [
+            (
+                "https://en.wikipedia.org/wiki/Foo_(bar)",
+                "https://en.wikipedia.org/wiki/Foo_(bar",
+            ),
+            ("https://example.com/path;", "https://example.com/path"),
+            ("https://example.com/?q=bang!", "https://example.com/?q=bang"),
+        ],
+    )
+    def test_a_truncated_terminal_url_character_does_not_vouch(
+        self,
+        content,
+        truncated,
+    ):
+        """Coverage must compare the URL the user supplied, including legal
+        terminal characters, rather than two equally-truncated scanner values."""
+        response = f"# Inbox Evaluation\n**Source:** {truncated}"
+
+        assert _uncovered_urls(response, content) == [content]
 
     # ---- Codex #1820 regressions -------------------------------------------
 
@@ -188,7 +242,7 @@ class TestUncoveredUrls:
             "http://example.com/article",  # scheme-insensitive
             "example.com/article",  # bare, at the very start of a line
         ):
-            response = f"# Inbox Evaluation\n{same}"
+            response = f"# Inbox Evaluation\n**Source:** {same}"
             assert _uncovered_urls(response, content) == [], f"false miss on {same}"
 
     @staticmethod
