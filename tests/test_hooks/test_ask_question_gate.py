@@ -74,7 +74,13 @@ def _declare(repo: Path, home: Path, *, session_id: str | None = None) -> None:
 
 
 def _ask(
-    repo: Path, home: Path, questions: list[dict], *, env_extra: dict | None = None, **extra
+    repo: Path,
+    home: Path,
+    questions: list[dict],
+    *,
+    event: str = "PreToolUse",
+    env_extra: dict | None = None,
+    **extra,
 ) -> subprocess.CompletedProcess:
     # env_extra is a KEYWORD of its own rather than something popped back out of
     # **extra: the earlier version spread **extra into the payload first and
@@ -82,7 +88,7 @@ def _ask(
     # field instead.
     payload = json.dumps(
         {
-            "hook_event_name": "PreToolUse",
+            "hook_event_name": event,
             "tool_name": "AskUserQuestion",
             "tool_input": {"questions": questions},
             "session_id": "test",
@@ -128,6 +134,23 @@ def test_an_ask_carrying_every_remedy_passes(repo, home):
         [_q("robust-by-construction redesign", "narrow the scope", "shelve the change")],
     )
     assert res.returncode == 0, res.stderr
+
+
+def test_a_completed_compliant_ask_records_presentation(repo, home):
+    _declare(repo, home, session_id="test")
+    question = _q("robust-by-construction redesign", "narrow the scope", "shelve the change")
+    res = _ask(
+        repo,
+        home,
+        [question],
+        event="PostToolUse",
+        tool_use_id="toolu_presented",
+    )
+    assert res.returncode == 0, res.stderr
+    state_file = next((home / ".genesis" / "review_rounds").glob("*.json"))
+    demand = json.loads(state_file.read_text())["gate_demand"]
+    assert demand["presented_tool_use_id"] == "toolu_presented"
+    assert demand["presented_at"] > demand["declared_at"]
 
 
 def test_extra_option_is_blocked_without_crashing_open(repo, home):
@@ -450,6 +473,12 @@ def test_the_gate_is_actually_wired(settings):
     assert matched, "no PreToolUse matcher for AskUserQuestion"
     commands = [h.get("command", "") for e in matched for h in e.get("hooks", [])]
     assert any("ask_question_gate.py" in c for c in commands), commands
+
+    post_entries = settings["hooks"]["PostToolUse"]
+    post_matched = [e for e in post_entries if e.get("matcher") == "AskUserQuestion"]
+    assert post_matched, "no PostToolUse matcher for AskUserQuestion"
+    post_commands = [h.get("command", "") for e in post_matched for h in e.get("hooks", [])]
+    assert any("ask_question_gate.py" in c for c in post_commands), post_commands
 
 
 def test_the_wired_path_resolves_to_a_real_script(settings):

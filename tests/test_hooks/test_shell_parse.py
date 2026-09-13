@@ -887,10 +887,7 @@ class TestTrailingOverrideArg:
         assert sp.trailing_override_arg(seg, "escalation-ack") is None
 
     def test_repeated_conflicting_arguments_are_all_visible(self):
-        seg = (
-            'git commit -m "x"  # escalation-ack:redesign '
-            "escalation-ack:shelve"
-        )
+        seg = 'git commit -m "x"  # escalation-ack:redesign escalation-ack:shelve'
         assert sp.trailing_override_args(seg, "escalation-ack") == ["redesign", "shelve"]
 
     def test_repeated_named_and_bare_arguments_are_all_visible(self):
@@ -930,12 +927,14 @@ class TestTrailingOverrideArg:
         scanner, so the claim is true by construction rather than by inspection.
         """
         tree = ast.parse(inspect.getsource(sp))
-        scanner = "_leading_run_sigil_token"
-        for name in ("_has_trailing_override", "trailing_override_arg"):
+        readers = {
+            "_has_trailing_override": "_leading_run_sigil_token",
+            "trailing_override_arg": "_leading_run_sigil_token",
+            "trailing_override_args": "_leading_run_sigil_tokens",
+        }
+        for name, scanner in readers.items():
             fn = next(
-                n
-                for n in ast.walk(tree)
-                if isinstance(n, ast.FunctionDef) and n.name == name
+                n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name
             )
             called = {
                 n.func.id

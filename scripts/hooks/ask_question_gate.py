@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse gate: an ask must carry a blocking gate's declared remedies.
+"""Ask gate: validate a declared menu before use and receipt it after completion.
 
 WHY THIS EXISTS, measured rather than supposed. On 2026-08-31 the review
 escalation cap blocked with a message whose first line enumerated three remedies
@@ -11,7 +11,9 @@ The first fix attempted was a note-to-self, which is the same class of thing tha
 failed: a convention, asked to hold at the one moment attention is elsewhere. This
 is the mechanical version. While a gate's remedy set is declared and still
 unacknowledged, an ``AskUserQuestion`` is refused unless one of its questions
-offers every declared remedy among its options.
+offers every declared remedy among its options. Its matching ``PostToolUse`` then
+records that the compliant question actually completed; a prepared menu alone is
+not evidence that the user ever saw it.
 
 WHY A BLOCK AND NOT AN ADVISORY. The house default is advisory, and escalating
 needs a specific measured reason. Here it is: the failure mode is a strong prior
@@ -119,12 +121,30 @@ def main() -> int:
     remedies = demand["remedies"]
     missing = missing_remedies(tool_input(payload).get("questions"), remedies)
     if not missing:
+        if payload.get("hook_event_name") == "PostToolUse":
+            tool_use_id = payload.get("tool_use_id")
+            gate = demand.get("gate")
+            target_cwd = demand.get("worktree_root") or cwd
+            if isinstance(tool_use_id, str) and tool_use_id and isinstance(gate, str):
+                from review_state import mark_gate_demand_presented
+
+                mark_gate_demand_presented(
+                    cwd=target_cwd if isinstance(target_cwd, str) else cwd,
+                    gate=gate,
+                    session_id=session_id if isinstance(session_id, str) else None,
+                    tool_use_id=tool_use_id,
+                )
+        return 0
+
+    # PostToolUse cannot prevent an Ask that has already completed. It only
+    # receipts a menu that the PreToolUse half proved compliant, so malformed or
+    # version-skewed post payloads degrade to an absent receipt and the commit
+    # remains blocked.
+    if payload.get("hook_event_name") == "PostToolUse":
         return 0
 
     by_key = {r["key"]: r.get("label") or r["key"] for r in remedies}
-    listed = "\n".join(
-        f"  - {k}: {by_key[k]}" if k in by_key else f"  - {k}" for k in missing
-    )
+    listed = "\n".join(f"  - {k}: {by_key[k]}" if k in by_key else f"  - {k}" for k in missing)
     everything = "\n".join(f"  - {r['key']}: {r.get('label') or r['key']}" for r in remedies)
     print(
         f"BLOCKED: the '{demand.get('gate', 'gate')}' gate is waiting on a decision, "

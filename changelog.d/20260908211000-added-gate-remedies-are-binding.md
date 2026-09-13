@@ -38,4 +38,7 @@
   without leaking ownerless legacy state across worktrees. Clean confirmation
   retires an obsolete escalation demand; choosing `shelve` records the answer
   but does not authorize the commit; and terminal plus escalation decisions must
-  be presented and acknowledged in sequence.
+  be presented and acknowledged in sequence. A completed compliant question now
+  leaves a receipt before the second acknowledgment can pass, and each worktree's
+  whole state update is serialized so simultaneous sessions cannot erase one
+  another's demands.

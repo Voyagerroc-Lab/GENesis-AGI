@@ -1261,6 +1261,13 @@ was chosen). The payload facts above stand on their own and are what a future
 consumer would start from — and any such consumer should degrade to "cannot
 prove it", since this shape is undocumented and version-volatile.
 
+The enumerated-remedy gate uses the documented matching `PostToolUse` event as a
+narrower completion receipt. It records only that a menu already validated by
+the `PreToolUse` hook completed; it does not infer which option the user chose.
+If that event is absent or malformed, no receipt is written and a coincident
+terminal-plus-escalation acknowledgment remains blocked. The acknowledgment
+still names the selected remedy separately.
+
 
 ## Known Risks
 

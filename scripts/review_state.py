@@ -54,6 +54,7 @@ external marks.)
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -61,6 +62,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -758,8 +760,40 @@ def get_review_round(cwd: str | None = None) -> int:
     return _coerce_finite_int(state.get("round", 0))
 
 
-def _write_round(state: dict, cwd: str | None = None) -> None:
-    """Persist the round-counter state (best-effort — never raises)."""
+@contextlib.contextmanager
+def _round_lock(cwd: str | None = None):
+    """Serialize one worktree's complete round-state transaction.
+
+    The state file carries counters and independently owned gate demands. Locking
+    only the final rename still lets two sessions read the same snapshot and have
+    the last writer erase the other's update, so callers hold this lock across
+    load, mutation, and publish. The lock file is intentionally persistent; the
+    kernel releases the advisory lock when a process exits.
+    """
+    handle = None
+    locked = False
+    try:
+        rf = _round_file(cwd)
+        rf.parent.mkdir(parents=True, exist_ok=True)
+        handle = rf.with_suffix(".json.lock").open("a+")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        locked = True
+    except OSError:
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                handle.close()
+    try:
+        yield locked
+    finally:
+        if locked and handle is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                handle.close()
+
+
+def _write_round(state: dict, cwd: str | None = None) -> bool:
+    """Persist round state atomically; return whether publication succeeded."""
     tmp: Path | None = None
     try:
         rf = _round_file(cwd)
@@ -769,13 +803,26 @@ def _write_round(state: dict, cwd: str | None = None) -> None:
         # {} back — which reads as "no counter, no demand" and fails the whole
         # gate OPEN. os.replace is atomic within a filesystem, so a reader sees
         # either the old file or the new one, never half of one.
-        tmp = rf.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2))
+        # Each writer needs its own scratch name. A shared ``.json.tmp`` lets one
+        # process replace or delete the other process's in-progress file even
+        # when their destination writes are atomic.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=rf.parent,
+            prefix=f".{rf.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as out:
+            tmp = Path(out.name)
+            json.dump(state, out, indent=2)
         os.replace(tmp, rf)
+        return True
     except OSError:
         if tmp is not None:
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
+        return False
 
 
 _CARRIED_FIELDS = ("gate_demand", "gate_demands")
@@ -785,7 +832,8 @@ def _demands(state: dict | None) -> list[dict]:
     """Normalized demand records, including the legacy single-slot shape."""
     if not isinstance(state, dict):
         return []
-    rows = [dict(d) for d in state.get("gate_demands", []) if isinstance(d, dict)]
+    raw_rows = state.get("gate_demands", [])
+    rows = [dict(d) for d in raw_rows if isinstance(d, dict)] if isinstance(raw_rows, list) else []
     legacy = state.get("gate_demand")
     if isinstance(legacy, dict) and legacy not in rows:
         rows.append(dict(legacy))
@@ -828,7 +876,7 @@ def _carry(prev: dict | None, branch: str) -> dict:
     return {k: prev[k] for k in _CARRIED_FIELDS if k in prev}
 
 
-def bump_review_round(
+def _bump_review_round_unlocked(
     cwd: str | None = None, *, clean: bool = False, source: str = "internal"
 ) -> int:
     """Update the CROSS-MODEL defect-bearing-round streak for the current branch.
@@ -888,8 +936,8 @@ def bump_review_round(
             # Carry the whole prior state for this branch, then overwrite what
             # this write actually changes. Enumerating survivors one by one is
             # what dropped `gate_demand` here while `reset_review_round` kept
-                # it — two writers of one file disagreeing about its shape.
-                **_carry(_prev, branch),
+            # it — two writers of one file disagreeing about its shape.
+            **_carry(_prev, branch),
             "branch": branch,
             "round": 0,
             "lifetime": lifetime,
@@ -941,6 +989,18 @@ def bump_review_round(
     return _coerce_finite_int(state.get("round", 0))
 
 
+def bump_review_round(
+    cwd: str | None = None, *, clean: bool = False, source: str = "internal"
+) -> int:
+    """Update review counters without losing a concurrent session's state."""
+    if source != "external":
+        return get_review_round(cwd=cwd)
+    with _round_lock(cwd) as locked:
+        if not locked:
+            return get_review_round(cwd=cwd)
+        return _bump_review_round_unlocked(cwd=cwd, clean=clean, source=source)
+
+
 def get_final_accept_consumed(cwd: str | None = None) -> bool:
     """True once this branch has spent its ONE final-round acceptance.
 
@@ -956,7 +1016,7 @@ def get_final_accept_consumed(cwd: str | None = None) -> bool:
     return bool(state.get("final_accept_consumed"))
 
 
-def consume_final_accept(cwd: str | None = None) -> None:
+def _consume_final_accept_unlocked(cwd: str | None = None) -> None:
     """Spend this branch's final-round acceptance. Best-effort, never raises.
 
     Recorded at the moment the gate ALLOWS the acked commit, because a PreToolUse
@@ -986,6 +1046,13 @@ def consume_final_accept(cwd: str | None = None) -> None:
     _write_round({**state, "final_accept_consumed": True}, cwd)
 
 
+def consume_final_accept(cwd: str | None = None) -> None:
+    """Spend the acceptance inside the worktree's serialized state transaction."""
+    with _round_lock(cwd) as locked:
+        if locked:
+            _consume_final_accept_unlocked(cwd)
+
+
 def get_review_lifetime(cwd: str | None = None) -> int:
     """Counted review rounds over this branch's WHOLE life. Never raises.
 
@@ -1002,7 +1069,7 @@ def get_review_lifetime(cwd: str | None = None) -> int:
     return _coerce_finite_int(state.get("lifetime", 0))
 
 
-def reset_review_round(cwd: str | None = None) -> None:
+def _reset_review_round_unlocked(cwd: str | None = None) -> None:
     """Reset the CONSECUTIVE streak, PRESERVING the lifetime count. Never raises.
 
     Deliberately a rewrite rather than the unlink this used to do. The only
@@ -1053,14 +1120,21 @@ def reset_review_round(cwd: str | None = None) -> None:
     )
 
 
-def write_gate_demand(
+def reset_review_round(cwd: str | None = None) -> None:
+    """Reset the streak inside the worktree's serialized state transaction."""
+    with _round_lock(cwd) as locked:
+        if locked:
+            _reset_review_round_unlocked(cwd)
+
+
+def _write_gate_demand_unlocked(
     *,
     gate: str,
     remedies: list[dict],
     required_action: str,
     cwd: str | None = None,
     session_id: str | None = None,
-) -> None:
+) -> bool:
     """Record a blocking gate's enumerated remedy set as DATA. Never raises.
 
     A gate that enumerates remedies in prose is trusting the session to relay
@@ -1107,7 +1181,28 @@ def write_gate_demand(
     # Compatibility/readability alias for older consumers and hand inspection.
     state["gate_demand"] = demand
     state.setdefault("branch", get_current_branch(cwd=cwd))
-    _write_round(state, cwd)
+    return _write_round(state, cwd)
+
+
+def write_gate_demand(
+    *,
+    gate: str,
+    remedies: list[dict],
+    required_action: str,
+    cwd: str | None = None,
+    session_id: str | None = None,
+) -> bool:
+    """Record a demand transactionally and report whether it persisted."""
+    with _round_lock(cwd) as locked:
+        if not locked:
+            return False
+        return _write_gate_demand_unlocked(
+            gate=gate,
+            remedies=remedies,
+            required_action=required_action,
+            cwd=cwd,
+            session_id=session_id,
+        )
 
 
 def read_gate_demand(
@@ -1128,6 +1223,7 @@ def read_gate_demand(
     Never raises — ``_load_round`` already normalizes shape and value, and a
     non-object ``gate_demand`` from a hand edit is rejected here.
     """
+
     def select(state: dict, *, exact_owner: bool) -> dict | None:
         if state.get("branch") != get_current_branch(cwd=state.get("worktree_root") or cwd):
             return None
@@ -1142,9 +1238,7 @@ def read_gate_demand(
                 if not exact_owner and owner not in (None, session_id):
                     continue
             remedies = [
-                r
-                for r in demand.get("remedies", [])
-                if isinstance(r, dict) and r.get("key")
+                r for r in demand.get("remedies", []) if isinstance(r, dict) and r.get("key")
             ]
             if remedies:
                 candidates.append({**demand, "remedies": remedies})
@@ -1186,13 +1280,13 @@ def read_gate_demand(
     return None
 
 
-def satisfy_gate_demand(
+def _satisfy_gate_demand_unlocked(
     choice: str,
     cwd: str | None = None,
     *,
     gate: str | None = None,
     session_id: str | None = None,
-) -> None:
+) -> bool:
     """Retire the live demand, recording WHICH remedy was chosen. Never raises.
 
     ``gate`` names the gate the caller is answering. When given, a demand
@@ -1210,7 +1304,56 @@ def satisfy_gate_demand(
     before = json.dumps(_demands(state), sort_keys=True)
     _retire_demands(state, gate=gate, choice=choice, session_id=session_id)
     if json.dumps(_demands(state), sort_keys=True) != before:
-        _write_round(state, cwd)
+        return _write_round(state, cwd)
+    return False
+
+
+def satisfy_gate_demand(
+    choice: str,
+    cwd: str | None = None,
+    *,
+    gate: str | None = None,
+    session_id: str | None = None,
+) -> bool:
+    """Retire a demand transactionally and report whether state changed."""
+    with _round_lock(cwd) as locked:
+        if not locked:
+            return False
+        return _satisfy_gate_demand_unlocked(choice, cwd=cwd, gate=gate, session_id=session_id)
+
+
+def mark_gate_demand_presented(
+    *,
+    cwd: str | None = None,
+    gate: str,
+    session_id: str | None,
+    tool_use_id: str,
+) -> bool:
+    """Record that a compliant Ask completed for one live demand."""
+    if not tool_use_id:
+        return False
+    with _round_lock(cwd) as locked:
+        if not locked:
+            return False
+        state = _load_round(cwd)
+        rows = _demands(state)
+        changed = False
+        now = time.time()
+        for demand in rows:
+            owner_matches = demand.get("session_id") in (None, session_id)
+            if (
+                demand.get("gate") == gate
+                and demand.get("satisfied_with") is None
+                and owner_matches
+            ):
+                demand["presented_at"] = now
+                demand["presented_tool_use_id"] = tool_use_id
+                changed = True
+        if not changed:
+            return False
+        state["gate_demands"] = rows
+        state["gate_demand"] = rows[-1]
+        return _write_round(state, cwd)
 
 
 def get_current_branch(cwd: str | None = None) -> str:

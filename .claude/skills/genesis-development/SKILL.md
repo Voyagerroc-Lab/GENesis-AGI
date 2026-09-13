@@ -2373,7 +2373,7 @@ memory: a strong prior ("split or ship") beat the text in front of it. That
 matters, because re-showing the text is exactly the intervention that does not
 work against a template override.
 
-Three layers now make the set mechanical, and each will simply refuse you:
+Four layers now make the set mechanical, and each will simply refuse you:
 
 1. **The gate declares its remedies as data** (`review_state.write_gate_demand`),
    so what it asked for outlives the message.
@@ -2383,7 +2383,11 @@ Three layers now make the set mechanical, and each will simply refuse you:
    the standing convention already asks for at least two per call, so nothing has
    to be dropped to make room. **The remedy for this refusal is to ADD the
    missing options, never to skip the ask.**
-3. **The acknowledgment must NAME the choice** — `# escalation-ack:redesign`,
+3. **The completed ask is receipted** by the matching `PostToolUse` hook. A
+   demand existing on disk proves only that the gate prepared a menu; it does not
+   prove the user saw it. Where two gates coincide, the second acknowledgment is
+   refused until its own compliant ask has completed.
+4. **The acknowledgment must NAME the choice** — `# escalation-ack:redesign`,
    not a bare `# escalation-ack`. The block message prints the exact runnable
    form for each remedy, so the vocabulary is always in front of you.
 

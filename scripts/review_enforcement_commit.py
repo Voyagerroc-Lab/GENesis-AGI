@@ -620,8 +620,7 @@ _ESCALATION_REMEDIES = (
     {
         "key": "narrow",
         "label": "narrow the scope",
-        "detail": "cut the change down to the part that is converging and take the "
-        "rest separately",
+        "detail": "cut the change down to the part that is converging and take the rest separately",
     },
     {
         "key": "shelve",
@@ -668,7 +667,7 @@ def _declare_remedies(
     required_action: str,
     cwd: str | None,
     session_id: str | None = None,
-) -> None:
+) -> bool:
     """Write the remedy set to state so later layers can check against it.
 
     Best-effort by contract (``write_gate_demand`` never raises): a gate must
@@ -677,20 +676,20 @@ def _declare_remedies(
     try:
         from review_state import write_gate_demand
 
-        write_gate_demand(
-            gate=gate,
-            remedies=[{"key": r["key"], "label": r["label"]} for r in remedies],
-            required_action=required_action,
-            cwd=cwd,
-            session_id=session_id,
+        return bool(
+            write_gate_demand(
+                gate=gate,
+                remedies=[{"key": r["key"], "label": r["label"]} for r in remedies],
+                required_action=required_action,
+                cwd=cwd,
+                session_id=session_id,
+            )
         )
     except Exception:  # noqa: BLE001 — bookkeeping must never break the block
-        pass
+        return False
 
 
-def _acked_remedy(
-    segs: list, remedies: tuple[dict, ...], sigil: str
-) -> tuple[bool, set]:
+def _acked_remedy(segs: list, remedies: tuple[dict, ...], sigil: str) -> tuple[bool, set]:
     """(the sigil is present on every commit segment, the set of args it carries).
 
     Returns the SET rather than a single choice so the caller can tell three
@@ -1103,9 +1102,7 @@ def main() -> None:
             # required — the escalation cap below is still live once this one clears.
             # Printing only one would send a session round a loop of alternating
             # blocks, so name the co-required form when it applies.
-            escalation_hint = (
-                " escalation-ack:<remedy>" if round_n >= ESCALATION_ROUND_CAP else ""
-            )
+            escalation_hint = " escalation-ack:<remedy>" if round_n >= ESCALATION_ROUND_CAP else ""
             # Declared for the ask-time gate even though this sigil needs no
             # argument. The two caps differ structurally: `escalation-ack` attests
             # to a CHOICE among three remedies, so a bare token names nothing,
@@ -1161,34 +1158,53 @@ def main() -> None:
         spend_final_accept = True
 
     if round_n >= ESCALATION_ROUND_CAP:
-        acked, args = _acked_remedy(
-            commit_segs, _ESCALATION_REMEDIES, "escalation-ack"
-        )
+        acked, args = _acked_remedy(commit_segs, _ESCALATION_REMEDIES, "escalation-ack")
         valid_keys = {r["key"] for r in _ESCALATION_REMEDIES}
         choice = next(iter(args)) if len(args) == 1 else None
         named = sorted(a for a in args if a)
         conflicting = named if len(args) > 1 and None not in args else []
         partly_bare = named if len(args) > 1 and None in args else []
         session_id = payload.get("session_id")
-        if spend_final_accept and choice in valid_keys and not read_gate_demand(
-            cwd=cwd, session_id=session_id, gate="escalation-cap"
-        ):
+        escalation_demand = read_gate_demand(cwd=cwd, session_id=session_id, gate="escalation-cap")
+        if spend_final_accept and choice in valid_keys and not escalation_demand:
             required = (
                 "The terminal decision is recorded. Now present the escalation "
                 "remedies as a separate user decision before acknowledging one."
             )
-            _declare_remedies(
+            persisted = _declare_remedies(
                 _ESCALATION_REMEDIES,
                 gate="escalation-cap",
                 required_action=required,
                 cwd=cwd,
                 session_id=session_id,
             )
+            persistence_note = (
+                ""
+                if persisted
+                else "\n\nThe decision record could not be persisted. Restore write "
+                "access to ~/.genesis/review_rounds and retry; no escalation "
+                "acknowledgment can be accepted until the record exists."
+            )
             _deny(
                 "BLOCKED: the final-round and escalation decisions cannot be "
                 "collapsed into one invented acknowledgment. "
                 + required
                 + "\n\n"
+                + _render_remedies(_ESCALATION_REMEDIES, "escalation-ack")
+                + persistence_note
+                + _merge_note(cwd)
+            )
+            return
+        if (
+            spend_final_accept
+            and choice in valid_keys
+            and escalation_demand
+            and not escalation_demand.get("presented_at")
+        ):
+            _deny(
+                "BLOCKED: the escalation remedies were recorded but have not been "
+                "presented through a completed compliant AskUserQuestion. Present "
+                "that separate decision to the user before acknowledging one.\n\n"
                 + _render_remedies(_ESCALATION_REMEDIES, "escalation-ack")
                 + _merge_note(cwd)
             )
@@ -1214,7 +1230,8 @@ def main() -> None:
                 + "); the rest carried a bare ack. Every commit segment must "
                 "name the SAME remedy.\n"
                 if partly_bare
-                else "\n\nThe ack named " + " and ".join(f"'{c}'" for c in conflicting)
+                else "\n\nThe ack named "
+                + " and ".join(f"'{c}'" for c in conflicting)
                 + " on different segments of one command. That is not a decision "
                 "either — name ONE remedy, identically, on every commit segment.\n"
                 if conflicting
@@ -1241,8 +1258,7 @@ def main() -> None:
                 + _render_remedies(_ESCALATION_REMEDIES, "escalation-ack")
                 + "\n\nRelay ALL of them. Do not add an option this gate does not "
                 "list — 'ship as-is' is the outcome this cap exists to prevent, and "
-                "presenting it is the corruption, not a shortcut around it."
-                + _merge_note(cwd)
+                "presenting it is the corruption, not a shortcut around it." + _merge_note(cwd)
             )
             return
         if choice == "shelve":

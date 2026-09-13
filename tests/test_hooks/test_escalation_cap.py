@@ -11,20 +11,24 @@ convention.)
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOK = _REPO_ROOT / "scripts" / "review_enforcement_commit.py"
+_ASK_HOOK = _REPO_ROOT / "scripts" / "hooks" / "ask_question_gate.py"
 _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+import review_enforcement_commit as commit_guard  # noqa: E402
 import review_state  # noqa: E402
 
 COMMIT_WIP = "git" + " commit -m " + chr(34) + "wip" + chr(34)
@@ -219,6 +223,40 @@ def _run_hook(command: str, repo: Path, home: Path) -> subprocess.CompletedProce
         input=payload,
         cwd=str(repo),
         env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _present_escalation(repo: Path, home: Path) -> subprocess.CompletedProcess:
+    payload = json.dumps(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "toolu_answered",
+            "tool_input": {
+                "questions": [
+                    {
+                        "question": "How should this change proceed?",
+                        "header": "Review gate",
+                        "multiSelect": False,
+                        "options": [
+                            {"label": "robust-by-construction redesign", "description": "r"},
+                            {"label": "narrow the scope", "description": "n"},
+                            {"label": "shelve the change", "description": "s"},
+                        ],
+                    }
+                ]
+            },
+            "session_id": "test",
+        }
+    )
+    return subprocess.run(
+        [sys.executable, str(_ASK_HOOK)],
+        input=payload,
+        cwd=str(repo),
+        env={**os.environ, "HOME": str(home)},
         capture_output=True,
         text=True,
         timeout=30,
@@ -489,11 +527,39 @@ def test_round_write_cleans_up_temp_when_replace_fails(repo, _isolate_rounds, mo
         raise OSError("forced replace failure")
 
     monkeypatch.setattr(review_state.os, "replace", fail_replace)
-    review_state._write_round({"branch": "main", "round": 1}, str(repo))
+    assert review_state._write_round({"branch": "main", "round": 1}, str(repo)) is False
 
     round_file = review_state._round_file(str(repo))
     assert not round_file.exists()
     assert list(round_file.parent.glob("*.tmp")) == []
+
+
+def test_round_writes_use_unique_temp_paths(repo, _isolate_rounds, monkeypatch):
+    sources = []
+
+    def capture_replace(src, _dst):
+        sources.append(Path(src))
+        Path(src).unlink()
+
+    monkeypatch.setattr(review_state.os, "replace", capture_replace)
+    assert review_state._write_round({"branch": "main", "round": 1}, str(repo)) is True
+    assert review_state._write_round({"branch": "main", "round": 2}, str(repo)) is True
+    assert len(sources) == 2
+    assert sources[0] != sources[1]
+
+
+def test_declare_remedies_reports_a_persistence_failure(monkeypatch):
+    monkeypatch.setattr(review_state, "write_gate_demand", lambda **_kwargs: False)
+    assert (
+        commit_guard._declare_remedies(
+            commit_guard._ESCALATION_REMEDIES,
+            gate="escalation-cap",
+            required_action="relay them",
+            cwd=None,
+            session_id="test",
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize("bad", ["[]", "42", '"str"', "null", "[1, 2, 3]"])
@@ -1044,11 +1110,18 @@ def test_a_denied_command_does_not_spend_the_acceptance(repo, home):
     denied = _run_hook('git commit -m "accept"  # final-round-accept', repo, home)
     assert denied.returncode == 2, denied.stdout + denied.stderr
     assert "already used" not in denied.stderr.lower()
-    # The acceptance must still be available to the co-required form.
-    ok = _run_hook('git commit -m "accept"  # final-round-accept escalation-ack:redesign', repo, home)
+    presented = _present_escalation(repo, home)
+    assert presented.returncode == 0, presented.stderr
+    # The acceptance must still be available after the separate decision reaches
+    # the user, when the co-required form is retried.
+    ok = _run_hook(
+        'git commit -m "accept"  # final-round-accept escalation-ack:redesign', repo, home
+    )
     assert ok.returncode == 0, ok.stdout + ok.stderr
     # ...and only NOW is it spent.
-    after = _run_hook('git commit -m "more"  # final-round-accept escalation-ack:redesign', repo, home)
+    after = _run_hook(
+        'git commit -m "more"  # final-round-accept escalation-ack:redesign', repo, home
+    )
     assert after.returncode == 2, after.stdout + after.stderr
     assert "already used" in after.stderr.lower(), after.stderr
 
@@ -1150,13 +1223,18 @@ def test_terminal_and_cap_together_accept_either_sigil_order(repo, home, cmd):
     assert "FINAL ROUND" in blocked.stderr, "the terminal must be the one blocking"
     # One command cannot answer two questions that were not both presented.
     # The first invocation records terminal acceptance, declares the next gate,
-    # and refuses. Repeating the explicit pair then answers the live escalation
-    # demand; either token order must parse identically.
+    # and refuses. Repeating the command without a completed Ask must still be
+    # refused; existence of a demand is not evidence it reached the user.
     first = _run_hook(cmd, repo, home)
     assert first.returncode == 2, f"{cmd} -> {first.returncode}: {first.stderr}"
     assert "cannot be collapsed" in first.stderr
     second = _run_hook(cmd, repo, home)
-    assert second.returncode == 0, f"{cmd} -> {second.returncode}: {second.stderr}"
+    assert second.returncode == 2, f"{cmd} -> {second.returncode}: {second.stderr}"
+    assert "present" in second.stderr.lower()
+    presented = _present_escalation(repo, home)
+    assert presented.returncode == 0, presented.stderr
+    third = _run_hook(cmd, repo, home)
+    assert third.returncode == 0, f"{cmd} -> {third.returncode}: {third.stderr}"
 
 
 def test_terminal_message_names_the_co_required_sigil(repo, home):
@@ -1346,6 +1424,7 @@ def test_the_cap_still_blocks_when_the_demand_was_never_written(repo, home):
     for f in files:
         state = json.loads(f.read_text())
         assert state.pop("gate_demand", None) is not None, "the block should declare"
+        assert state.pop("gate_demands", None), "the block should declare history"
         assert state.get("round", 0) >= review_state.ESCALATION_ROUND_CAP
         f.write_text(json.dumps(state))
     res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
@@ -1394,8 +1473,10 @@ def test_a_compound_naming_two_remedies_is_not_a_decision(repo, home):
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
     _run_hook(COMMIT_WIP, repo, home)
     res = _run_hook(
-        COMMIT_WIP + "  # escalation-ack:redesign && "
-        + "git" + " commit --amend --no-edit  # escalation-ack:shelve",
+        COMMIT_WIP
+        + "  # escalation-ack:redesign && "
+        + "git"
+        + " commit --amend --no-edit  # escalation-ack:shelve",
         repo,
         home,
     )
@@ -1409,8 +1490,10 @@ def test_a_compound_with_one_bare_segment_says_so(repo, home):
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
     _run_hook(COMMIT_WIP, repo, home)
     res = _run_hook(
-        COMMIT_WIP + "  # escalation-ack:redesign && "
-        + "git" + " commit --amend --no-edit  # escalation-ack",
+        COMMIT_WIP
+        + "  # escalation-ack:redesign && "
+        + "git"
+        + " commit --amend --no-edit  # escalation-ack",
         repo,
         home,
     )
@@ -1450,16 +1533,14 @@ def test_the_terminal_demand_is_retired_when_its_sigil_is_honoured(repo, home):
     demand = json.loads(files[0].read_text())["gate_demand"]
     assert demand["gate"] == "final-round-cap"
     assert demand["satisfied_with"] is None
-    next_gate = _run_hook(
-        COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home
-    )
+    next_gate = _run_hook(COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home)
     assert next_gate.returncode == 2, next_gate.stdout + next_gate.stderr
     state = json.loads(files[0].read_text())
     terminal = next(d for d in state["gate_demands"] if d["gate"] == "final-round-cap")
     assert terminal["satisfied_with"] == "accept"
-    ok = _run_hook(
-        COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home
-    )
+    presented = _present_escalation(repo, home)
+    assert presented.returncode == 0, presented.stderr
+    ok = _run_hook(COMMIT_WIP + "  # final-round-accept escalation-ack:redesign", repo, home)
     assert ok.returncode == 0, ok.stdout + ok.stderr
 
 
@@ -1524,6 +1605,64 @@ def test_two_sessions_in_one_worktree_keep_independent_demands(_isolate_rounds, 
     assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-B") is not None
 
 
+def test_simultaneous_session_demands_do_not_lose_an_owner(_isolate_rounds, repo, monkeypatch):
+    """Force both writers to read the same snapshot unless the RMW is locked."""
+    original_load = review_state._load_round
+    rendezvous = threading.Barrier(2)
+
+    def synchronized_load(cwd=None):
+        state = original_load(cwd)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            rendezvous.wait(timeout=0.25)
+        return state
+
+    monkeypatch.setattr(review_state, "_load_round", synchronized_load)
+
+    def declare(session):
+        review_state.write_gate_demand(
+            gate="escalation-cap",
+            remedies=[{"key": "redesign", "label": "redesign it"}],
+            required_action="relay them",
+            cwd=str(repo),
+            session_id=session,
+        )
+
+    threads = [threading.Thread(target=declare, args=(s,)) for s in ("sess-A", "sess-B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is not None
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-B") is not None
+
+
+def test_malformed_demand_collection_recovers_legacy_record(_isolate_rounds, repo):
+    legacy = {
+        "gate": "escalation-cap",
+        "session_id": "sess-A",
+        "remedies": [{"key": "redesign", "label": "redesign it"}],
+        "satisfied_with": None,
+    }
+    review_state._round_file(str(repo)).parent.mkdir(parents=True, exist_ok=True)
+    review_state._round_file(str(repo)).write_text(
+        json.dumps(
+            {
+                "branch": "feature/x",
+                "last_source": "external",
+                "gate_demands": None,
+                "gate_demand": legacy,
+            }
+        )
+    )
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") == legacy
+    review_state.satisfy_gate_demand(
+        "redesign", cwd=str(repo), gate="escalation-cap", session_id="sess-A"
+    )
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is None
+
+
 def test_clean_review_retires_live_escalation_demand(_isolate_rounds, repo):
     review_state.write_gate_demand(
         gate="escalation-cap",
@@ -1562,6 +1701,8 @@ def test_satisfy_will_not_stamp_another_gates_demand(repo, _isolate_rounds):
     )
     review_state.satisfy_gate_demand("redesign", cwd=str(repo), gate="escalation-cap")
     assert review_state.read_gate_demand(cwd=str(repo)) is not None
+
+
 def test_the_new_parser_symbol_is_not_a_module_scope_import():
     """Structural lock on a fail DIRECTION, not on style.
 
@@ -1583,7 +1724,7 @@ def test_the_new_parser_symbol_is_not_a_module_scope_import():
     for node in tree.body:  # module scope only
         if isinstance(node, ast.ImportFrom) and node.module == "shell_parse":
             names = {a.name for a in node.names}
-            assert "trailing_override_arg" not in names, (
+            assert not {"trailing_override_arg", "trailing_override_args"} & names, (
                 "moving this to module scope converts a fail-CLOSED skew into a "
                 "fail-OPEN one — see the comment at its call site"
             )
