@@ -67,11 +67,14 @@ _WRAPPER_SPEC = {
         0,
     ),
     "doas": ({"-u", "-C"}, 0),
-    # `-S`/`--split-string` carries a whole command line as ONE token. Listing it
-    # here stops that token being mistaken for the executable; seeing the command
-    # INSIDE it is a separate job, done by `_env_split_string` + the nested walk,
-    # because a table entry alone would hide the command rather than reveal it.
-    "env": ({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}, 0),
+    # `-S`/`--split-string` is deliberately ABSENT, and its absence is tracked
+    # rather than accidental. It carries a whole command line as ONE token, so
+    # listing it here would stop that token being read as the executable while
+    # HIDING what it carries — strictly worse than today's visible mis-read. It
+    # needs the nested walk, and `-S` has its own escape language, appends the
+    # arguments that follow it, and re-reads the split fields as env's own
+    # options. That is a grammar to model against the binary, not a table entry.
+    "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
     "nice": ({"-n", "--adjustment"}, 0),
     "ionice": ({"-c", "--class", "-n", "--classdata", "-p", "--pid"}, 0),
     "chrt": (set(), 1),
@@ -1360,8 +1363,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
-        pre_strip = _argv(seg.argv_src)
-        argv = _strip_wrappers(pre_strip)
+        argv = _strip_wrappers(_argv(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
             Segment(exe=exe, argv=argv, override=override, raw=raw, redirects=list(seg.redirects))
@@ -1371,12 +1373,6 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
             script = _nested_script(argv)
             if script:
                 nested.append(script)
-        # `env -S 'cmd'` runs `cmd`. Read from the PRE-strip argv: stripping
-        # removes `env` and this flag's value together, so the carried command is
-        # only reachable here.
-        env_script = _env_split_string(pre_strip)
-        if env_script:
-            nested.append(env_script)
         # $(...) / `...` bodies also execute — parsed from RAW, which STILL carries any
         # expansion redirect target, so a nested command stays visible to the guards.
         nested.extend(_substitutions(raw))
@@ -1488,45 +1484,6 @@ def _substitutions(text: str) -> list[str]:
                 continue
         i += 1
     return subs
-
-
-_ENV_SPLIT_FLAGS = ("-S", "--split-string")
-
-
-def _env_split_string(argv: list[str]) -> str:
-    """The command line carried by ``env -S``/``--split-string``, else ''.
-
-    ``env -S 'git push …'`` splits that one token into arguments and RUNS them,
-    so the token is a command, not a value. Before this was handled the whole
-    string resolved as the executable and every gate keying on ``seg.exe`` saw a
-    command named ``git push …`` — MEASURED, the push guard exited 0 on a force
-    push it blocks when written plainly, and the form runs.
-
-    Reading it from the PRE-strip argv is deliberate: ``_strip_wrappers`` removes
-    ``env`` along with this flag's value, so by the time a segment is resolved the
-    string is gone. Listing the flag in ``_WRAPPER_SPEC`` stops it being mistaken
-    for the exe; only this recovers what it carries.
-
-    All four spellings MEASURED to run, and all four are read here: ``-S 'cmd'``,
-    the glued ``-S'cmd'`` (one token after shell quoting), ``--split-string=cmd``
-    and ``--split-string 'cmd'``.
-    """
-    for i, tok in enumerate(argv):
-        if _basename(tok) != "env":
-            continue
-        for j in range(i + 1, len(argv)):
-            t = argv[j]
-            if t in _ENV_SPLIT_FLAGS:
-                return argv[j + 1] if j + 1 < len(argv) else ""
-            for flag in _ENV_SPLIT_FLAGS:
-                if t.startswith(f"{flag}=") and flag.startswith("--"):
-                    return t[len(flag) + 1 :]
-                if flag == "-S" and t.startswith("-S") and len(t) > 2:
-                    return t[2:]  # glued short form
-            if not t.startswith("-"):
-                break  # a bare word — env's own args are over
-        break
-    return ""
 
 
 def _nested_script(argv: list[str]) -> str:
