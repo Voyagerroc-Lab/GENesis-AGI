@@ -43,7 +43,6 @@
 #
 # Env overrides:
 #   CODE_INTEL_INDEX_MEMORY_MAX   default: measured 4096M, BOUNDED by the container
-#   CODE_INTEL_INDEX_OOM_SCORE_ADJ default 900    (above cc/invoker.py's 500; raise-only)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
 #   CODE_INTEL_INDEX_CPU_QUOTA    default 200%   (2 cores worth)
 #   CODE_INTEL_INDEX_MODE         default fast   (fast|moderate|full; 3rd arg wins)
@@ -116,6 +115,7 @@ MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 # which is admission control and is deliberately NOT claimed here as present.
 _CI_MEM_TARGET_MB=4096   # the 2,836 MB measurement + ~40% headroom
 _CI_MEM_CONTAINER_FRACTION=60  # percent of the container limit the cap may take
+_CI_MEM_MIN_MB=256       # below this, refuse instead of exceeding the parent
 # ...AND never come within this much of the container limit. The fraction alone
 # is not enough: 60% of a 4 GiB minimum install is 2,457M, which leaves 1,639M
 # for genesis-server + Qdrant + a CC session together — so the parent cgroup can
@@ -130,23 +130,20 @@ _CI_MEM_RESERVE_MB=2048
 
 # What this CANNOT do, stated so nobody reads more into it: no static cap can
 # guarantee the scope fires before the container, because the headroom at the
-# moment of pressure depends on what everything else is doing. That guarantee
-# needs admission control — refusing to START a job that cannot fit — which is
-# NOT built (issue tracked separately) and is NOT claimed here. What the bound
-# does deliver is that the cap can never approach the container limit, and the
-# oom_score_adj below makes the indexer the preferred victim if the container
-# does hit its own OOM.
+# moment of pressure depends on what everything else is doing. Unknown or tiny
+# parent limits are therefore refused before launch; dynamic admission control
+# against current usage is separate work and is not claimed here.
 _derive_mem_max() {
-    # Container limit from cgroup v2, then v1. "max" (uncapped) or unreadable
-    # means nothing bounds us, so the measured target stands.
+    # Read this process's exact cgroup chain. A readable `max`/v1 sentinel is
+    # known-unbounded; missing, unreadable or malformed metadata is UNKNOWN and
+    # fails closed. Treating both states as "4096M" was the unsafe ambiguity.
     #
     # Read with the `read` BUILTIN, not `cat`: this entrypoint can run with a
     # minimal PATH (the rlimit-fallback environment its own tests construct), and
     # `cat` missing there made the read fail, empty the value, and silently
     # return the UNBOUNDED target — restoring a cap equal to the parent limit on
     # exactly the constrained install the bound protects. A builtin cannot go
-    # missing. Failure now `continue`s to the next candidate instead of breaking
-    # out of the loop, so an unreadable v2 path still lets v1 be tried.
+    # missing.
     # Walk THIS PROCESS'S OWN cgroup chain and take the SMALLEST finite limit on
     # it — not just the container root. cgroup v2 nested limits only restrict
     # further and are enforced across the subtree, so a constrained ANCESTOR binds
@@ -162,68 +159,117 @@ _derive_mem_max() {
     # shape, different controller.
     local root="${CODE_INTEL_FAKE_CGROUP_ROOT:-/sys/fs/cgroup}"
     local selfcg="${CODE_INTEL_FAKE_CGROUP_SELF:-/proc/self/cgroup}"
-
-    local rel="" line
-    if [ -r "$selfcg" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                0::*) rel="${line#0::}" ; break ;;   # v2 has a single 0:: line
-            esac
-        done < "$selfcg" 2>/dev/null
+    if [ ! -r "$selfcg" ]; then
+        echo "ERROR: cannot determine the process cgroup; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+        return 1
     fi
+
+    local v2_rel="" v1_rel="" line controllers rel
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            0::*)
+                v2_rel="${line#0::}"
+                ;;
+            *:*:*)
+                controllers="${line#*:}"
+                controllers="${controllers%%:*}"
+                case ",$controllers," in
+                    *,memory,*) v1_rel="${line#*:*:}" ;;
+                esac
+                ;;
+        esac
+    done < "$selfcg" 2>/dev/null
+
+    local mount="" filename="" version=""
+    if [ -n "$v1_rel" ]; then
+        mount="$root/memory"; rel="$v1_rel"
+        filename="memory.limit_in_bytes"; version="v1"
+    elif [ -n "$v2_rel" ]; then
+        mount="$root"; rel="$v2_rel"; filename="memory.max"; version="v2"
+    else
+        echo "ERROR: cannot determine a memory-controller cgroup for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+        return 1
+    fi
+
+    case "$rel" in
+        *" (deleted)") rel="${rel% (deleted)}" ;;
+    esac
+    case "$rel" in
+        /*) : ;;
+        *)
+            echo "ERROR: cannot determine a safe cgroup path for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+            ;;
+    esac
+    case "/${rel#/}/" in
+        *"/../"*|*"/./"*)
+            echo "ERROR: cannot determine a safe cgroup path for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
+            ;;
+    esac
     [ "$rel" = "/" ] && rel=""
 
-    local limit_mb="" dir="$root$rel"
+    local limit_bytes="" dir="$mount$rel" f v v_len
     while :; do
-        local f="$dir/memory.max" v=""
-        if [ -r "$f" ]; then
-            # Do NOT gate on read's exit status: `read` returns non-zero at EOF
-            # when the file has no trailing newline, even though it HAS set the
-            # variable. Gating on it made a newline-less memory.max look
-            # unreadable and fall through to the unbounded target — the exact
-            # fail-open this bound exists to prevent.
-            read -r v < "$f" 2>/dev/null || true
-            case "$v" in
-                '' | max | *[!0-9]*) : ;;   # uncapped or unparseable at this level
-                *)
-                    local mb=$(( v / 1024 / 1024 ))
-                    # Skip an implausibly huge "no limit" sentinel.
-                    if [ "$mb" -gt 0 ] && [ "$mb" -le 4194304 ]; then
-                        if [ -z "$limit_mb" ] || [ "$mb" -lt "$limit_mb" ]; then
-                            limit_mb=$mb
-                        fi
-                    fi
-                    ;;
-            esac
+        f="$dir/$filename"
+        if [ ! -r "$f" ]; then
+            echo "ERROR: cannot determine the binding memory limit: $f is unreadable; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+            return 1
         fi
-        [ "$dir" = "$root" ] && break
+        v=""
+        # `read` returns non-zero at EOF for a newline-less file after setting v.
+        read -r v < "$f" 2>/dev/null || true
+        case "$v" in
+            max)
+                [ "$version" = "v2" ] || {
+                    echo "ERROR: cannot determine the binding memory limit: invalid v1 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                    return 1
+                }
+                ;;
+            -1)
+                [ "$version" = "v1" ] || {
+                    echo "ERROR: cannot determine the binding memory limit: invalid v2 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                    return 1
+                }
+                ;;
+            ''|*[!0-9]*)
+                echo "ERROR: cannot determine the binding memory limit: $f is malformed; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                return 1
+                ;;
+            *)
+                # v1 reports a huge numeric sentinel for unlimited. Avoid shell
+                # integer overflow by classifying values wider than 16 digits
+                # before arithmetic; any such limit is immaterial to a 4 GiB cap.
+                v_len="${#v}"
+                if [ "$version" = "v1" ] && { [ "$v_len" -gt 16 ] || { [ "$v_len" -eq 16 ] && [ "$v" -gt 4503599627370496 ]; }; }; then
+                    :
+                elif [ -z "$limit_bytes" ] || [ "$v" -lt "$limit_bytes" ]; then
+                    limit_bytes="$v"
+                fi
+                ;;
+        esac
+
+        [ "$dir" = "$mount" ] && break
         dir="${dir%/*}"
-        # Never step above the cgroup root, whatever /proc/self/cgroup claimed.
         case "$dir" in
-            "$root"*) : ;;
-            *) break ;;
+            "$mount"|"$mount"/*) : ;;
+            *)
+                echo "ERROR: cannot determine a safe cgroup path for this process; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                return 1
+                ;;
         esac
     done
 
-    # cgroup v1 fallback, only if the v2 walk found nothing at all.
-    if [ -z "$limit_mb" ]; then
-        local v1="$root/memory/memory.limit_in_bytes" v=""
-        if [ -r "$v1" ]; then
-            read -r v < "$v1" 2>/dev/null || true
-            case "$v" in
-                '' | max | *[!0-9]*) : ;;
-                *)
-                    local mb=$(( v / 1024 / 1024 ))
-                    [ "$mb" -gt 0 ] && [ "$mb" -le 4194304 ] && limit_mb=$mb
-                    ;;
-            esac
-        fi
-    fi
-
-    # Nothing finite anywhere on the branch → nothing bounds us, target stands.
-    if [ -z "$limit_mb" ]; then
+    # Every level was readable and explicitly unlimited.
+    if [ -z "$limit_bytes" ]; then
         printf '%sM\n' "$_CI_MEM_TARGET_MB"
         return 0
+    fi
+
+    local limit_mb=$(( limit_bytes / 1024 / 1024 ))
+    if [ "$limit_mb" -lt "$_CI_MEM_MIN_MB" ]; then
+        echo "ERROR: binding memory limit (${limit_bytes} bytes) is too small for a safe index scope; refusing to start." >&2
+        return 1
     fi
 
     # The cap is the SMALLEST of: the measured target, a fraction of the BINDING
@@ -234,17 +280,21 @@ _derive_mem_max() {
     local by_reserve=$(( limit_mb - _CI_MEM_RESERVE_MB ))
     [ "$by_reserve" -lt "$cap" ] && cap=$by_reserve
 
-    # A container smaller than the reserve makes by_reserve <= 0. Emit a small
-    # positive floor rather than "0M" or a negative: systemd would reject the
-    # malformed value and the scope would carry NO cap at all, which is the
-    # fail-open-to-worse this whole block exists to avoid. Such a host cannot
-    # run an index that needs 2.8 GiB regardless — it will be killed at its
-    # scope, which is the correct failure (the container survives).
-    [ "$cap" -lt 256 ] && cap=256
+    # A parent that cannot leave both the reserve and the minimum useful scope
+    # cannot run this 2.8 GiB index. Refuse instead of raising the cap above a
+    # known parent or silently discarding a sub-MiB finite limit.
+    if [ "$cap" -lt "$_CI_MEM_MIN_MB" ]; then
+        echo "ERROR: binding memory limit (${limit_mb} MiB) is too small for a safe index scope; refusing to start." >&2
+        return 1
+    fi
     printf '%sM\n' "$cap"
 }
 
-MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-$(_derive_mem_max)}"
+if [ -n "${CODE_INTEL_INDEX_MEMORY_MAX:-}" ]; then
+    MEM_MAX="$CODE_INTEL_INDEX_MEMORY_MAX"
+elif ! MEM_MAX="$(_derive_mem_max)"; then
+    exit 1
+fi
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"

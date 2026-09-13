@@ -5,7 +5,7 @@
   measurement, and it is bounded so it can never approach the limit of whatever
   it is actually running inside: not just the machine's own ceiling, but any
   tighter limit set anywhere above the job, since the tightest one is what really
-  applies. On a small install the job gets less rather than being handed a cap
-  equal to all the memory there is, which would protect nothing. On a machine too
-  small to index at all the job still dies, which is the right outcome — better a
-  stale index than a machine that falls over.
+  applies. On a smaller install the job gets less rather than being handed a cap
+  equal to all the memory there is, which would protect nothing. If the limit is
+  unknown or too small to leave the safety reserve, indexing is refused before
+  launch rather than risking the rest of the machine.

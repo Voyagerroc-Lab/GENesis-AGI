@@ -118,6 +118,32 @@ def _fake_cgroup_env(tmp_path: Path, *levels: int) -> dict[str, str]:
     }
 
 
+def _fake_cgroup_v1_env(
+    tmp_path: Path, *levels: int, hybrid_v2: bool = False
+) -> dict[str, str]:
+    """Build a v1 memory-controller hierarchy, root first and leaf last."""
+    tag = "-".join(str(x) for x in levels) or "default"
+    root = tmp_path / f"cg-v1-{tag}"
+    mount = root / "memory"
+    rel_parts = [f"level{i}" for i in range(1, len(levels))]
+    d = mount
+    for i, val in enumerate(levels):
+        if i:
+            d = d / rel_parts[i - 1]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "memory.limit_in_bytes").write_text(f"{val}\n", encoding="utf-8")
+    selfcg = tmp_path / f"selfcgroup-v1-{tag}"
+    rel = "/" + "/".join(rel_parts)
+    lines = ["8:cpu,cpuacct:/ignored", f"5:memory,blkio:{rel}"]
+    if hybrid_v2:
+        lines.append("0::/unified-without-memory-controller")
+    selfcg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+        "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+    }
+
+
 def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
     env = {
         "PATH": path,
@@ -418,6 +444,31 @@ def test_env_overrides_reach_scope(tmp_path):
     assert "CPUQuota=100%" in calls
 
 
+def test_memory_override_is_the_explicit_escape_from_unknown_cgroup(tmp_path):
+    """An operator-provided cap bypasses auto-detection without weakening it."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    root = tmp_path / "empty-cgroup-root"
+    root.mkdir()
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_INDEX_MEMORY_MAX": "768M",
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(tmp_path / "missing-self-cgroup"),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=768M" in slog.read_text()
+    assert "codebase-memory-mcp ARGS:" in log.read_text()
+
+
 def test_probe_failure_falls_back_to_rlimit(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     slog = tmp_path / "systemd-run.log"
@@ -468,14 +519,8 @@ def test_cap_leaves_a_reserve_on_a_small_container(tmp_path):
     assert "MemoryMax=2048M" in slog.read_text(), slog.read_text()
 
 
-def test_cap_never_emits_a_nonpositive_value(tmp_path):
-    """A container smaller than the reserve must not produce "0M" or a negative.
-
-    systemd would reject a malformed value and the scope would then carry NO cap
-    at all — failing open to something strictly worse than the bug. A small
-    positive floor keeps the scope real; such a host cannot run this index
-    regardless, and being killed at its own scope is the correct outcome.
-    """
+def test_cap_refuses_parent_below_minimum_safe_scope(tmp_path):
+    """A derived floor must never exceed the known parent cgroup limit."""
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     slog = tmp_path / "systemd-run.log"
     _fake_tools(fakebin, log)
@@ -483,12 +528,147 @@ def test_cap_never_emits_a_nonpositive_value(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-        env_extra=_fake_cgroup_env(tmp_path, 1 * 1024**3),
+        env_extra=_fake_cgroup_env(tmp_path, 128 * 1024**2),
+    )
+    assert res.returncode != 0
+    assert "too small" in res.stderr.lower()
+    assert not slog.exists()
+    assert not log.exists()
+
+
+def test_cap_refuses_sub_mib_parent_instead_of_discarding_it(tmp_path):
+    """Integer-MiB conversion must not turn a tiny finite limit into unbounded."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_env(tmp_path, 512 * 1024),
+    )
+    assert res.returncode != 0
+    assert "too small" in res.stderr.lower()
+    assert not log.exists()
+
+
+def test_cap_refuses_when_process_cgroup_is_unreadable(tmp_path):
+    """Missing cgroup metadata is unknown, not evidence of no parent limit."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    root = tmp_path / "empty-cgroup-root"
+    root.mkdir()
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(tmp_path / "missing-self-cgroup"),
+        },
+    )
+    assert res.returncode != 0
+    assert "cannot determine" in res.stderr.lower()
+    assert not log.exists()
+
+
+def test_cap_refuses_unparseable_limit_on_the_active_chain(tmp_path):
+    """A malformed active limit cannot be skipped in favor of a larger ancestor."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    root, selfcg = _fake_cgroup_tree(tmp_path, 32 * 1024**3, 0)
+    (root / "level1" / "memory.max").write_text("not-a-limit\n", encoding="utf-8")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+        },
+    )
+    assert res.returncode != 0
+    assert "cannot determine" in res.stderr.lower()
+    assert not log.exists()
+
+
+def test_cap_accepts_explicitly_unbounded_v2_chain(tmp_path):
+    """Readable `max` is known-unbounded and still permits the measured target."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_env(tmp_path, 0, 0),
     )
     assert res.returncode == 0, res.stderr
-    calls = slog.read_text()
-    assert "MemoryMax=256M" in calls, calls
-    assert "MemoryMax=0M" not in calls and "MemoryMax=-" not in calls
+    assert "MemoryMax=4096M" in slog.read_text()
+
+
+def test_cap_walks_v1_memory_controller_hierarchy(tmp_path):
+    """The smallest v1 ancestor binds just as it does on cgroup v2."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_v1_env(tmp_path, 32 * 1024**3, 3 * 1024**3),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=1024M" in slog.read_text()
+
+
+def test_cap_uses_v1_memory_controller_on_a_hybrid_host(tmp_path):
+    """A controller-less unified entry must not mask the v1 memory hierarchy."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_v1_env(
+            tmp_path, 32 * 1024**3, 3 * 1024**3, hybrid_v2=True
+        ),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=1024M" in slog.read_text()
+
+
+def test_cap_accepts_v1_unlimited_sentinel(tmp_path):
+    """The kernel's large v1 sentinel is known-unbounded, not unreadable."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra=_fake_cgroup_v1_env(tmp_path, 9223372036854771712),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=4096M" in slog.read_text()
 
 
 def test_cap_is_derived_without_depending_on_PATH(tmp_path):
@@ -663,8 +843,8 @@ def test_triggers_enqueue_markers_and_do_not_spawn():
         )
 
 
-# ── 3c. cap bounded by the container, and adj normalisation ──────────────────
-# Both from Codex P1/P2 on this PR. The cap was shipped as an absolute 4G, which
+# ── 3c. cap bounded by the container ─────────────────────────────────────────
+# The cap was shipped as an absolute 4G, which
 # EQUALS the container limit on a minimum install (host-setup.sh floors an
 # install at 4 GiB) — a cap equal to the whole container isolates nothing.
 
@@ -681,7 +861,7 @@ def _derive_mem_max(limit_bytes: str | None, tmp_path, *ancestors: str) -> str:
     """
     src = _ENTRYPOINT.read_text()
     start = src.index("_CI_MEM_TARGET_MB=")
-    end = src.index("MEM_MAX=", start)
+    end = src.index('if [ -n "${CODE_INTEL_INDEX_MEMORY_MAX:-}" ]', start)
     body = src[start:end]
 
     root = tmp_path / "cg"
@@ -748,9 +928,8 @@ def test_cap_is_bounded_by_the_container_limit(tmp_path):
     assert _derive_mem_max(str(4 * gib), tmp_path) == "2048M"
     # 32 GiB: the measured target is well under the bound, so it stands.
     assert _derive_mem_max(str(32 * gib), tmp_path) == "4096M"
-    # Uncapped container ("max") or unreadable: nothing bounds us, target stands.
+    # Explicitly uncapped container ("max"): the measured target stands.
     assert _derive_mem_max("max", tmp_path) == "4096M"
-    assert _derive_mem_max(None, tmp_path) == "4096M"
 
 
 def test_cap_is_emitted_as_M_so_the_rlimit_fallback_can_parse_it(tmp_path):
@@ -760,9 +939,7 @@ def test_cap_is_emitted_as_M_so_the_rlimit_fallback_can_parse_it(tmp_path):
     "running memory-uncapped", failing OPEN to something worse than the bug.
     """
     gib = 1024 * 1024 * 1024
-    for limit in (str(4 * gib), str(32 * gib), "max", None):
+    for limit in (str(4 * gib), str(32 * gib), "max"):
         out = _derive_mem_max(limit, tmp_path)
         assert out.endswith("M"), out
         assert "%" not in out
-
-
