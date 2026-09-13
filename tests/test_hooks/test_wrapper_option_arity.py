@@ -122,13 +122,22 @@ class TestWronglyListedOptionsNoLongerEatTheCommand:
 
 # ── the lock ────────────────────────────────────────────────────────────
 
-# EVERY option spelling on a line, each with whatever immediately follows it.
-# Reading only a leading `-x, --long` pair was too narrow for the layouts these
-# tools actually print: `xvfb-run` writes `-n NUM    --server-num=NUM`, putting
-# the placeholder BETWEEN the two spellings, so the long form was never seen at
-# all. The lookbehind keeps a hyphen inside a description word ("non-blank") from
-# reading as an option.
-_OPTION_AT = re.compile(r"(?:(?<=^)|(?<=\s))--?[A-Za-z][-A-Za-z0-9]*")
+# EVERY option spelling in a line's DECLARATION region, each with whatever
+# immediately follows it. Reading only a leading `-x, --long` pair was too narrow
+# for the layouts these tools actually print: `xvfb-run` writes
+# `-n NUM    --server-num=NUM`, putting the placeholder BETWEEN the two
+# spellings, so the long form was never seen at all. The lookbehind keeps a
+# hyphen inside a description word ("non-blank") from reading as an option, and
+# the digit is there because `xargs` documents `-0, --null` — a numeric spelling
+# an earlier version skipped, which left it unparsed and therefore unchecked.
+_OPTION_AT = re.compile(r"(?:(?<=^)|(?<=\s))--?[A-Za-z0-9][-A-Za-z0-9]*")
+# Where the DESCRIPTION starts: a column gap followed by a word. Everything after
+# it is prose, and prose REFERS to options it does not declare — `xargs` writes
+# `-I R    same as --replace=R`, which read as a declaration reported `--replace`
+# as value-taking. That is not a cosmetic slip: it made the lock pass the exact
+# table entry this change exists to remove. A following `-` is NOT a description,
+# because that is the second spelling in `-e FILE   --error-file=FILE`.
+_DESCRIPTION_AT = re.compile(r"\s\s+[A-Za-z]")
 # `-e, --eof[=END]` — the two spellings are separated by nothing but a comma, so
 # they SHARE the one tail that follows the pair. Distinguished from
 # `-n NUM  --server-num=NUM`, where the gap carries the short form's own value.
@@ -142,7 +151,7 @@ _PAIR_GAP = re.compile(r"^,?\s*$")
 # zero-argument and failed the lock on a CORRECT entry. The trailing `\b` is what
 # keeps an ordinary capitalised description word out ("Reopen stdin as …" does
 # not match, because `R` is followed by a lowercase letter and no boundary).
-_REQUIRED_TAIL = re.compile(r"^(=\S| <[^>]+>| [A-Z][-A-Z]*\b)")
+_REQUIRED_TAIL = re.compile(r"^(=\S| <[^>]+>| [A-Za-z][-A-Za-z0-9]*\b)")
 
 
 def _documented_arity(help_text: str) -> dict[str, str]:
@@ -172,9 +181,11 @@ def _documented_arity(help_text: str) -> dict[str, str]:
     """
     rank = {"zero": 0, "optional": 1, "required": 2}
     arity: dict[str, str] = {}
-    for line in help_text.splitlines():
-        if not line.strip().startswith("-"):
+    for raw_line in help_text.splitlines():
+        if not raw_line.strip().startswith("-"):
             continue
+        cut = _DESCRIPTION_AT.search(raw_line)
+        line = raw_line[: cut.start()] if cut else raw_line
         hits = [(m.start(), m.end(), m.group(0)) for m in _OPTION_AT.finditer(line)]
         kinds: list[str] = []
         for idx, (_, end, _name) in enumerate(hits):
@@ -200,7 +211,32 @@ def _documented_arity(help_text: str) -> dict[str, str]:
     return arity
 
 
+#: Wrappers that are shell BUILTINS, not files. `shutil.which` returns None for
+#: every one of them, so asking the filesystem skipped them permanently and the
+#: lock never checked a single entry — while `command`, `exec` and `time` are as
+#: able to eat a wrapped command as any binary (`exec -a name cmd`). Their
+#: authority is bash's own `help`, and for `time` that distinction is load
+#: bearing: `/usr/bin/time` is a DIFFERENT program from the shell keyword.
+_SHELL_BUILTINS = frozenset({"command", "exec"})
+#: `time` is deliberately in NEITHER path, and the reason is that it is two
+#: different tools wearing one name. Bash's `time` is a reserved word whose only
+#: option is `-p`; `/usr/bin/time` is a separate program with `-o`/`-f`, which is
+#: what `_WRAPPER_SPEC["time"]` actually describes, and which a segment reaches
+#: as `/usr/bin/time …` (basename `time`). Checking the table against bash's
+#: help would fail four correct entries; checking it against the external
+#: program's help would validate the keyword against a binary that need not be
+#: installed. One authority cannot settle it, so the lock says so rather than
+#: picking the one that happens to pass.
+_UNVERIFIABLE = frozenset({"time"})
+
+
 def _help_text(tool: str) -> str | None:
+    if tool in _SHELL_BUILTINS:
+        proc = subprocess.run(
+            ["bash", "-c", f"help {tool}"], capture_output=True, text=True, timeout=10
+        )
+        text = proc.stdout or ""
+        return text if len(text) > 40 else None
     if not shutil.which(tool):
         return None
     for args in ((tool, "--help"), (tool, "-h")):
@@ -228,14 +264,21 @@ class TestTableAgreesWithTheToolsThemselves:
 
     @pytest.mark.parametrize("tool", sorted(sp._WRAPPER_SPEC))
     def test_every_listed_option_documents_a_required_value(self, tool):
+        if tool in _UNVERIFIABLE:
+            pytest.skip(f"{tool} has no single authority to check against — see _UNVERIFIABLE")
         help_text = _help_text(tool)
         if help_text is None:
             pytest.skip(f"{tool} is not installed here — arity cannot be measured")
         arity = _documented_arity(help_text)
+        # An option this parser never SAW is reported as unverified, not waved
+        # through. Defaulting it to `required` was a hole in the lock itself:
+        # `xargs` documents `-0, --null`, a numeric spelling the pattern skipped,
+        # so adding that boolean to the table would have passed silently — the
+        # exact regression this test exists to prevent, hidden by the test.
         wrong = sorted(
-            (opt, arity[opt])
+            (opt, arity.get(opt, "NOT FOUND in --help"))
             for opt in sp._WRAPPER_SPEC[tool][0]
-            if arity.get(opt, "required") != "required"
+            if arity.get(opt) != "required"
         )
         assert not wrong, (
             f"{tool}: {wrong} listed as value-consuming, but the tool documents no "
@@ -288,3 +331,48 @@ class TestTableAgreesWithTheToolsThemselves:
         assert arity.get("-t") == "zero", arity.get("-t")
         assert arity.get("-i") == "optional", arity.get("-i")
         assert arity.get("-I") == "required", arity.get("-I")
+
+    def test_the_entry_this_change_removes_would_fail_the_lock(self):
+        """The sharpest guard-the-guard: re-add the exact bad entry, expect a fail.
+
+        `--replace` is the entry this change deletes. An earlier lock reported it
+        as `required` — because `xargs` writes `-I R   same as --replace=R` in a
+        DESCRIPTION, and reading prose as a declaration let the strictest-reading
+        rule promote it. The lock passed the very table entry it was built to
+        catch. Everything else here can be green while that is true, so this
+        assertion is the one that matters.
+        """
+        help_text = _help_text("xargs")
+        if help_text is None:
+            pytest.skip("xargs is not installed here")
+        arity = _documented_arity(help_text)
+        assert arity.get("--replace") == "optional", (
+            f"--replace read as {arity.get('--replace')!r}: a description "
+            f"reference is being taken for a declaration again"
+        )
+        assert arity.get("--eof") == "optional", arity.get("--eof")
+
+    def test_a_spelling_the_parser_cannot_read_is_reported_not_assumed(self):
+        """`xargs -0, --null` is numeric, and an unread option must not pass.
+
+        Defaulting an unparsed option to `required` meant the lock waved through
+        precisely what it could not see — the failure mode is silent, so the
+        numeric spelling is parsed AND the caller treats an absent reading as a
+        failure rather than a pass.
+        """
+        help_text = _help_text("xargs")
+        if help_text is None:
+            pytest.skip("xargs is not installed here")
+        arity = _documented_arity(help_text)
+        assert arity.get("-0") == "zero", arity.get("-0")
+        assert arity.get("--null") == "zero", arity.get("--null")
+
+    def test_a_shell_builtin_is_checked_against_bash_not_the_filesystem(self):
+        """`exec`/`command` are builtins; `which` returns None for both.
+
+        Asking the filesystem skipped them permanently, so the lock never read a
+        single entry for a wrapper that can eat a command (`exec -a name cmd`).
+        """
+        help_text = _help_text("exec")
+        assert help_text is not None, "bash help must answer for a builtin"
+        assert _documented_arity(help_text).get("-a") == "required"
