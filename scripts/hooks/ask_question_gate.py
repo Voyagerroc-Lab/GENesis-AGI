@@ -128,12 +128,57 @@ def main() -> int:
             if isinstance(tool_use_id, str) and tool_use_id and isinstance(gate, str):
                 from review_state import mark_gate_demand_presented
 
-                mark_gate_demand_presented(
+                if not mark_gate_demand_presented(
                     cwd=target_cwd if isinstance(target_cwd, str) else cwd,
                     gate=gate,
                     session_id=session_id if isinstance(session_id, str) else None,
                     tool_use_id=tool_use_id,
-                )
+                ):
+                    # The Ask already happened and was compliant — this is only
+                    # the receipt, so losing it refuses nothing and the exit
+                    # stays 0. It is still worth saying, because the receipt IS
+                    # load-bearing in one place.
+                    #
+                    # Scoped precisely rather than generously: `presented_at` is
+                    # consulted at exactly one site
+                    # (review_enforcement_commit.py:1215), and that branch is
+                    # guarded by `spend_final_accept` — i.e. ONLY where this cap
+                    # coincides with the round-7 terminal. On the ordinary path a
+                    # valid named ack is accepted with no receipt at all. Saying
+                    # "your commit will be blocked" would therefore be false, and
+                    # a gate that overstates its own consequences teaches the
+                    # next reader to discount its messages, which on enforcement
+                    # surface costs more than the silence it replaces.
+                    #
+                    # Emitted on the JSON channel, not stderr: PostToolUse is not
+                    # in hook_output.BARE_STDOUT_EVENTS, and this repo documents
+                    # `hookSpecificOutput.additionalContext` as the PostToolUse
+                    # route to the model (edit_verify_advisory.py). A warning on
+                    # a channel the model never reads is not a warning. Bounded
+                    # by print_json_bounded so an oversize payload loses prose
+                    # rather than becoming an unparseable preview.
+                    from hook_output import print_json_bounded
+
+                    print_json_bounded(
+                        {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PostToolUse",
+                                "additionalContext": (
+                                    "NOTE: your question satisfied the "
+                                    f"'{gate}' gate, but the receipt recording that "
+                                    "could not be written to ~/.genesis/review_rounds. "
+                                    "Nothing is blocked by this on the ordinary path. "
+                                    "It matters only where this gate coincides with "
+                                    "the round-7 terminal, where the acknowledgment "
+                                    "requires the receipt and would be refused. It can "
+                                    "also mean the demand is simply no longer live. "
+                                    "If you are near that terminal, check the directory "
+                                    "is writable and has free space."
+                                ),
+                            }
+                        },
+                        text_keys=("hookSpecificOutput.additionalContext",),
+                    )
         return 0
 
     # PostToolUse cannot prevent an Ask that has already completed. It only

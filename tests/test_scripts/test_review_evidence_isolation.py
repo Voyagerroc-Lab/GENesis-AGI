@@ -18,20 +18,24 @@ and are closed here:
 
 from __future__ import annotations
 
-import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+
+from tests.conftest import private_module
 
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("review_state", _SCRIPTS / "review_state.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["review_state"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    """A private instance of review_state, WITHOUT hijacking the shared name.
+
+    See `tests.conftest.private_module` for why the restore matters: leaving the
+    name registered made this file's private copy everyone's copy for the rest
+    of the session, which silently defeated a monkeypatch in another test file
+    and produced a failure visible only in the full suite, in collection order.
+    """
+    return private_module("review_state", _SCRIPTS / "review_state.py")
 
 
 _rs = _load()

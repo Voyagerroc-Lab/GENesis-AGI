@@ -1237,8 +1237,28 @@ def read_gate_demand(
                     continue
                 if not exact_owner and owner not in (None, session_id):
                     continue
+            # `.get(..., [])` returns None when the key EXISTS with a null
+            # value, and a number is iterable to nobody — either raises
+            # TypeError straight out of a reader whose docstring promises it
+            # cannot. That lands in ask_question_gate's top-level fail-open,
+            # which then allows an Ask despite a live sibling or legacy demand:
+            # malformed state would silently disarm the gate. Validate the inner
+            # field exactly as `_demands()` now validates the outer collection.
+            raw_remedies = demand.get("remedies")
+            if not isinstance(raw_remedies, list):
+                continue
+            # The key must be a STRING, not merely truthy. The next consumer
+            # builds `{r["key"]: ...}` (ask_question_gate), so a list or dict key
+            # raises `unhashable type` there — inside that hook's top-level
+            # fail-open, which then ALLOWS a non-compliant ask. Same defect as
+            # the non-list check above, one field deeper, and measured through
+            # the real hook rather than reasoned about. `isinstance` rather than
+            # `str()` coercion, so a skewed schema is SKIPPED rather than
+            # silently reinterpreted as a remedy nobody declared.
             remedies = [
-                r for r in demand.get("remedies", []) if isinstance(r, dict) and r.get("key")
+                r
+                for r in raw_remedies
+                if isinstance(r, dict) and isinstance(r.get("key"), str) and r["key"]
             ]
             if remedies:
                 candidates.append({**demand, "remedies": remedies})

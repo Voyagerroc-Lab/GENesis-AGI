@@ -482,6 +482,49 @@ def _guard_db_crud_not_mocked():
         )
 
 
+def private_module(name: str, path):
+    """Load ``path`` as a PRIVATE module without leaking ``name`` to everyone.
+
+    A test that wants its own instance of a script must register it in
+    ``sys.modules`` before ``exec_module`` — ``@dataclass`` resolves its owning
+    module out of there and raises on one that is absent. The trap is leaving it
+    registered afterwards.
+
+    MEASURED, and it is not theoretical: three test modules each did that for
+    the name ``review_state``. pytest imports every test module at COLLECTION,
+    so the last registration won for the whole session. Any test module
+    collected earlier had already bound the previous object, and production code
+    doing a call-time ``from review_state import ...`` then resolved a DIFFERENT
+    object than the one ``monkeypatch.setattr`` had patched — the patch silently
+    did nothing and the real function ran. Reproduced:
+    ``pytest tests/test_hooks/test_escalation_cap.py tests/test_scripts/`` fails
+    ``test_declare_remedies_reports_a_persistence_failure`` with
+    ``assert True is False``, while either file alone passes.
+
+    That is the shape this repo keeps re-learning: an obligation living at N call
+    sites, each asked to remember it. Here it lives in one place. Restoring what
+    was found also means a private copy stays genuinely private rather than
+    becoming everyone's copy by accident.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - unreachable for real files
+        raise ImportError(f"cannot load {name} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sentinel = object()
+    previous = sys.modules.get(name, sentinel)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if previous is sentinel:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+    return mod
+
+
 def require_access_denied(path) -> None:
     """Skip unless THIS process is actually stopped by ``path``'s mode bits.
 

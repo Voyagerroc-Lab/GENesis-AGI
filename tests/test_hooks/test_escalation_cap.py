@@ -1663,6 +1663,65 @@ def test_malformed_demand_collection_recovers_legacy_record(_isolate_rounds, rep
     assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") is None
 
 
+def test_the_shared_review_state_name_is_not_hijacked():
+    """The premise every monkeypatch in this file rests on.
+
+    `review_enforcement_commit` imports `review_state` at CALL time, so a patch
+    applied here only reaches production code if this module's `review_state`
+    and `sys.modules["review_state"]` are the SAME object. Three test modules
+    used to load a private copy under that shared name and never restore it;
+    because pytest imports every test module at collection, the last one won for
+    the whole session and patches here landed on nobody — a failure invisible in
+    a single-file run and red only in the full suite.
+
+    This asserts the premise directly, so the next unrestored hijack fails HERE,
+    naming the cause, instead of surfacing as an unrelated assertion three files
+    away. `tests.conftest.private_module` is the supported way to load one.
+    """
+    assert sys.modules.get("review_state") is review_state, (
+        "sys.modules['review_state'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it. Load it via tests.conftest.private_module instead."
+    )
+
+
+@pytest.mark.parametrize("bad", [None, 42, "redesign", {"key": "redesign"}, {"key": ["redesign"]}])
+def test_a_demand_whose_remedies_field_is_not_a_list_cannot_raise(_isolate_rounds, repo, bad):
+    """`read_gate_demand` promises it never raises. A hand-edited or
+    version-skewed `remedies` must therefore be skipped, not iterated.
+
+    `.get("remedies", [])` does NOT protect against this: the default applies
+    only when the key is ABSENT, so an explicit null returns None and iterating
+    it raises TypeError straight out of the reader. That lands in
+    ask_question_gate's top-level fail-open, which then allows an Ask while a
+    live sibling or legacy demand is still pending — malformed state silently
+    disarming the gate, which is the one outcome this reader must never produce.
+    """
+    good = {
+        "gate": "escalation-cap",
+        "session_id": "sess-A",
+        "remedies": [{"key": "redesign", "label": "redesign it"}],
+        "satisfied_with": None,
+    }
+    review_state._round_file(str(repo)).parent.mkdir(parents=True, exist_ok=True)
+    review_state._round_file(str(repo)).write_text(
+        json.dumps(
+            {
+                "branch": "feature/x",
+                "last_source": "external",
+                "gate_demands": [
+                    {"gate": "escalation-cap", "session_id": "sess-A", "remedies": bad},
+                    good,
+                ],
+            }
+        )
+    )
+    # Must not raise, and the VALID sibling must survive: skipping the malformed
+    # entry is the fix, dropping the whole file would be a different bug wearing
+    # the same green.
+    assert review_state.read_gate_demand(cwd=str(repo), session_id="sess-A") == good
+
+
 def test_clean_review_retires_live_escalation_demand(_isolate_rounds, repo):
     review_state.write_gate_demand(
         gate="escalation-cap",

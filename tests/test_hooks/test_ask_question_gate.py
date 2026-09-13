@@ -153,6 +153,60 @@ def test_a_completed_compliant_ask_records_presentation(repo, home):
     assert demand["presented_at"] > demand["declared_at"]
 
 
+def test_a_receipt_that_cannot_be_written_says_so(repo, home):
+    """A lost receipt must not become an unexplained loop.
+
+    The Ask already happened and was compliant, so this path must still exit 0 —
+    PostToolUse cannot un-ask a question. But the NEXT commit will be blocked as
+    "not presented" and told to ask again, and asking again cannot help when the
+    store is unwritable. Silence there costs the operator an indefinite cycle of
+    doing the one thing that cannot work; naming the directory ends it.
+    """
+    _declare(repo, home, session_id="test")
+    rounds = home / ".genesis" / "review_rounds"
+    # Make the publish fail the way a real permissions/disk fault does, rather
+    # than by patching the function out — the hook runs as a subprocess, so the
+    # failure has to be real for the call to reach it at all.
+    rounds.chmod(0o500)
+    # PREMISE PROBE, and it must probe CREATION specifically. `0o500` still
+    # permits listing, so conftest's directory probe (which lists) would report
+    # "not denied" for a directory that genuinely refuses the atomic write this
+    # test is about. Root and anything with CAP_DAC_OVERRIDE write straight
+    # through mode bits — and CI containers routinely run as root — so without
+    # this the test would PASS VACUOUSLY there, having asserted that nothing
+    # went wrong in a run where nothing was ever blocked.
+    try:
+        probe = rounds / ".premise-probe"
+        probe.touch()
+        probe.unlink()
+        rounds.chmod(0o700)
+        pytest.skip("this process writes through mode bits (root?); premise void")
+    except OSError:
+        pass
+    try:
+        res = _ask(
+            repo,
+            home,
+            [_q("robust-by-construction redesign", "narrow the scope", "shelve the change")],
+            event="PostToolUse",
+            tool_use_id="toolu_unwritable",
+        )
+    finally:
+        rounds.chmod(0o700)
+    assert res.returncode == 0, "a completed compliant Ask must never be refused after the fact"
+    # The JSON channel, NOT stderr: PostToolUse is absent from
+    # hook_output.BARE_STDOUT_EVENTS, so bare output there does not reach the
+    # model and a warning nobody reads is not a warning.
+    payload = json.loads(res.stdout)
+    note = payload["hookSpecificOutput"]["additionalContext"]
+    assert payload["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    assert "review_rounds" in note, note
+    # It must NOT claim the ordinary commit is blocked — `presented_at` is read
+    # only where this cap coincides with the round-7 terminal.
+    assert "round-7 terminal" in note, note
+    assert "Nothing is blocked by this on the ordinary path" in note, note
+
+
 def test_extra_option_is_blocked_without_crashing_open(repo, home):
     _declare(repo, home)
     res = _ask(
