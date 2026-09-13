@@ -212,42 +212,50 @@ _derive_mem_max() {
     local limit_bytes="" dir="$mount$rel" f v v_len
     while :; do
         f="$dir/$filename"
-        if [ ! -r "$f" ]; then
+        if [ ! -e "$f" ] && [ "$version" = "v2" ] && [ "$dir" = "$mount" ]; then
+            # cgroup v2 controller interface files exist only on non-root
+            # cgroups. Reaching the mount root without memory.max therefore
+            # means this final ancestor is unbounded, not that detection failed.
+            # A missing file anywhere BELOW the root remains an unknown limit
+            # and must fail closed.
+            :
+        elif [ ! -r "$f" ]; then
             echo "ERROR: cannot determine the binding memory limit: $f is unreadable; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
             return 1
+        else
+            v=""
+            # `read` returns non-zero at EOF for a newline-less file after setting v.
+            read -r v < "$f" 2>/dev/null || true
+            case "$v" in
+                max)
+                    [ "$version" = "v2" ] || {
+                        echo "ERROR: cannot determine the binding memory limit: invalid v1 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                        return 1
+                    }
+                    ;;
+                -1)
+                    [ "$version" = "v1" ] || {
+                        echo "ERROR: cannot determine the binding memory limit: invalid v2 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                        return 1
+                    }
+                    ;;
+                ''|*[!0-9]*)
+                    echo "ERROR: cannot determine the binding memory limit: $f is malformed; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
+                    return 1
+                    ;;
+                *)
+                    # v1 reports a huge numeric sentinel for unlimited. Avoid shell
+                    # integer overflow by classifying values wider than 16 digits
+                    # before arithmetic; any such limit is immaterial to a 4 GiB cap.
+                    v_len="${#v}"
+                    if [ "$version" = "v1" ] && { [ "$v_len" -gt 16 ] || { [ "$v_len" -eq 16 ] && [ "$v" -gt 4503599627370496 ]; }; }; then
+                        :
+                    elif [ -z "$limit_bytes" ] || [ "$v" -lt "$limit_bytes" ]; then
+                        limit_bytes="$v"
+                    fi
+                    ;;
+            esac
         fi
-        v=""
-        # `read` returns non-zero at EOF for a newline-less file after setting v.
-        read -r v < "$f" 2>/dev/null || true
-        case "$v" in
-            max)
-                [ "$version" = "v2" ] || {
-                    echo "ERROR: cannot determine the binding memory limit: invalid v1 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
-                    return 1
-                }
-                ;;
-            -1)
-                [ "$version" = "v1" ] || {
-                    echo "ERROR: cannot determine the binding memory limit: invalid v2 value; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
-                    return 1
-                }
-                ;;
-            ''|*[!0-9]*)
-                echo "ERROR: cannot determine the binding memory limit: $f is malformed; set CODE_INTEL_INDEX_MEMORY_MAX explicitly to override." >&2
-                return 1
-                ;;
-            *)
-                # v1 reports a huge numeric sentinel for unlimited. Avoid shell
-                # integer overflow by classifying values wider than 16 digits
-                # before arithmetic; any such limit is immaterial to a 4 GiB cap.
-                v_len="${#v}"
-                if [ "$version" = "v1" ] && { [ "$v_len" -gt 16 ] || { [ "$v_len" -eq 16 ] && [ "$v" -gt 4503599627370496 ]; }; }; then
-                    :
-                elif [ -z "$limit_bytes" ] || [ "$v" -lt "$limit_bytes" ]; then
-                    limit_bytes="$v"
-                fi
-                ;;
-        esac
 
         [ "$dir" = "$mount" ] && break
         dir="${dir%/*}"

@@ -615,6 +615,56 @@ def test_cap_accepts_explicitly_unbounded_v2_chain(tmp_path):
     assert "MemoryMax=4096M" in slog.read_text()
 
 
+def test_cap_accepts_v2_mount_root_without_memory_max(tmp_path):
+    """cgroup v2 intentionally omits controller files at the hierarchy root."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True)
+    repo = _make_repo(tmp_path)
+    root = tmp_path / "cgroup-v2-root"
+    root.mkdir()
+    selfcg = tmp_path / "self-cgroup-root"
+    selfcg.write_text("0::/\n", encoding="utf-8")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert "MemoryMax=4096M" in slog.read_text()
+
+
+def test_cap_refuses_missing_v2_memory_max_below_mount_root(tmp_path):
+    """A missing non-root controller file is unknown and must fail closed."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+    root = tmp_path / "cgroup-v2-root"
+    leaf = root / "slice"
+    leaf.mkdir(parents=True)
+    selfcg = tmp_path / "self-cgroup-leaf"
+    selfcg.write_text("0::/slice\n", encoding="utf-8")
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_FAKE_CGROUP_ROOT": str(root),
+            "CODE_INTEL_FAKE_CGROUP_SELF": str(selfcg),
+        },
+    )
+    assert res.returncode != 0
+    assert "cannot determine" in res.stderr.lower()
+    assert not log.exists()
+
+
 def test_cap_walks_v1_memory_controller_hierarchy(tmp_path):
     """The smallest v1 ancestor binds just as it does on cgroup v2."""
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
@@ -930,6 +980,11 @@ def test_cap_is_bounded_by_the_container_limit(tmp_path):
     assert _derive_mem_max(str(32 * gib), tmp_path) == "4096M"
     # Explicitly uncapped container ("max"): the measured target stands.
     assert _derive_mem_max("max", tmp_path) == "4096M"
+
+
+def test_cap_treats_absent_v2_root_limit_as_unbounded(tmp_path):
+    """The cgroup v2 mount root has no memory.max controller file."""
+    assert _derive_mem_max(None, tmp_path) == "4096M"
 
 
 def test_cap_is_emitted_as_M_so_the_rlimit_fallback_can_parse_it(tmp_path):
