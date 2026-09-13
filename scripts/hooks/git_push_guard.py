@@ -1058,7 +1058,21 @@ _CR_BLOCKING_WEIGHT = 1.0
 # from the score, exactly as for P1s. Fixed policy value that works on any clone —
 # deliberately not per-install configurable.
 _INLINE_P2_SCORE_WEIGHT = 0.5
-_INLINE_SCORE_BLOCK_THRESHOLD = 1.0
+# PER-LANE thresholds. The weights above are what a finding COSTS; these are what
+# a change can AFFORD before the merge stops, and they vary by how much it costs
+# to be wrong. MEASURED across this repo's review history: all 11 P1s ever raised
+# landed on guards / destructive paths / alerting / measurement, and ZERO on
+# ordinary features — so one global threshold either under-protects the first
+# group or over-blocks the second. `critical` keeps the historical 1.0 (any P1, or
+# two P2s); `standard` and `light` tolerate more before blocking, while the
+# always-fix floor (P1, leak/privacy, destructive) is a separate obligation this
+# score never governed.
+#
+# STILL "fixed policy values that work on any clone — deliberately not
+# per-install configurable", exactly as the note above says. Varying by LANE is a
+# property of the change; varying by INSTALL would be a property of the operator,
+# and only the second is what that sentence refuses. No config key is added.
+_INLINE_SCORE_BLOCK_THRESHOLDS = {"critical": 1.0, "standard": 2.0, "light": 3.0}
 _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
@@ -2655,27 +2669,83 @@ def _check_inline_review_findings(
     if p2:
         print(
             f"WARNING: PR #{pr_num} has {len(p2)} inline [P2] review finding(s) "
-            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the gate "
-            f"blocks at score >= {_INLINE_SCORE_BLOCK_THRESHOLD:.0f}, i.e. any P1 "
-            f"or {int(_INLINE_SCORE_BLOCK_THRESHOLD / _INLINE_P2_SCORE_WEIGHT)}+ P2s):",
+            f"(each adds {_INLINE_P2_SCORE_WEIGHT} to the review score; the "
+            f"threshold depends on this change's LANE and is named in the "
+            f"verdict below):",
             file=sys.stderr,
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
-    if score >= _INLINE_SCORE_BLOCK_THRESHOLD:
+    # The lane is resolved ONLY when there is a score to compare, so a PR with no
+    # blocking findings still pays nothing — the same laziness `_scope_cache`
+    # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
+    # gate has already asked it on this merge, so in practice this costs no API
+    # call at all.
+    lane = _pr_lane(pr_num, repo=repo) if score > 0 else "critical"
+    threshold = _INLINE_SCORE_BLOCK_THRESHOLDS[lane]
+    # THE ALWAYS-FIX FLOOR, in every lane, before the score is consulted.
+    #
+    # Severity floors; the lane governs VOLUME. A P1 or a CodeRabbit
+    # Critical/Major stops any merge whatever its lane, and the per-lane
+    # threshold only decides how many P2s may accumulate first.
+    #
+    # This is a RULE now because it used to be an accident. Before the lanes
+    # existed the single threshold was 1.0 and a P1 scores exactly 1.0, so the
+    # floor held by arithmetic — nothing named it, and nothing tested it. Raising
+    # the ordinary threshold to 2.0 would therefore have deleted it silently:
+    # a lone P1 on ordinary code would have scored 1.0 < 2.0 and passed a gate
+    # that has always stopped it.
+    #
+    # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
+    # must not be conflated. The genesis-development skill's always-fix floor is
+    # severity AND KIND — "a P1, a security defect, anything destructive or
+    # fail-open". This check can only see the severity LABEL a reviewer attached,
+    # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
+    # mechanical floor is the labelled subset; the rest still rests on somebody
+    # reading the report.
+    floor_hits = len(p1) + len(cr_block)
+    if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
-            + [f"  [P2] {t}" for t in p2[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
         )
         return True, (
-            f"review score {score:.1f} >= {_INLINE_SCORE_BLOCK_THRESHOLD:.1f} blocks "
-            f"(P1=1.0, P2={_INLINE_P2_SCORE_WEIGHT}, CodeRabbit Critical/Major="
-            f"{_CR_BLOCKING_WEIGHT:.0f} each): {len(p1)} unresolved [P1] + "
-            f"{len(p2)} unresolved [P2] + {len(cr_block)} CodeRabbit "
-            f"Critical/Major finding(s), none maintainer-replied:\n{listing}\n"
+            f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
+            f"CodeRabbit Critical/Major finding(s), none maintainer-replied "
+            f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
+            f"change is {lane.upper()}); the per-lane score threshold "
+            f"({threshold:.1f} here) governs how many P2s may accumulate, never "
+            f"whether a P1 counts:\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
+        )
+    if score >= threshold:
+        # P1s and CodeRabbit Critical/Majors cannot reach here — the floor above
+        # returned on any of them — so this branch is purely a P2 accumulation,
+        # and naming the other two terms would describe counts that are provably
+        # zero.
+        listing = "\n".join(f"  [P2] {t}" for t in p2[:8])
+        return True, (
+            f"review score {score:.1f} >= {threshold:.1f} blocks this "
+            f"{lane.upper()} change: {len(p2)} unresolved [P2] finding(s) at "
+            f"{_INLINE_P2_SCORE_WEIGHT} each, none maintainer-replied. (A P1 or a "
+            f"CodeRabbit Critical/Major would have blocked at the always-fix "
+            f"floor, whatever the lane.)\n{listing}\n"
+            f"Fix and reply in-thread, or append '# review-override' "
+            f"to the merge command to acknowledge and proceed."
+        )
+    if score > 0:
+        # Below the bar, but the findings are real and the lane is why they did
+        # not stop the merge. Say both, or an operator reading a passing gate
+        # cannot tell a low score from a wide budget.
+        print(
+            f"NOTE: PR #{pr_num} — review score {score:.1f} is under the "
+            f"{threshold:.1f} threshold for a {lane.upper()} change, so the "
+            f"findings above do not block. A CRITICAL change (enforcement hooks, "
+            f"CI config, API surfaces, migrations) blocks at "
+            f"{_INLINE_SCORE_BLOCK_THRESHOLDS['critical']:.1f}. Read them anyway: "
+            f"'not blocking' describes the gate, not the finding.",
+            file=sys.stderr,
         )
     # No unresolved P1 among what we read. If the read is INCOMPLETE (a later page
     # failed), a P1 could exist on an unread page — fail per _scan_unreadable rather
@@ -4040,7 +4110,53 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
     3000 entries; at the cap a hook file may sit beyond it → None (the caller
     fails closed). Tests inject via ``_TEST_GH_PR_FILES`` (one JSON object per
     line: ``{filename, previous_filename}``; the literal ``__error__`` simulates
-    an API error)."""
+    an API error).
+
+    MEMOIZED per (pr, repo) for the life of the process. Three call sites ask this
+    question on a single merge — the pin-receipt gate, the lane, and the inline
+    findings' off-diff scoping — and the first of those runs unconditionally
+    before the other two, so without a cache one merge paid for the same
+    ``pulls/N/files`` read more than once. The answer cannot change mid-hook: a
+    merge is bound to one head by ``--match-head-commit``, and a hook process
+    lives for one command. Cleared between tests by ``_reset_pr_files_cache``.
+    """
+    cache_key = (pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))
+    if cache_key in _PR_FILES_CACHE:
+        return _PR_FILES_CACHE[cache_key]
+    value = _pr_changed_files_uncached(pr_num, repo)
+    _PR_FILES_CACHE[cache_key] = value
+    return value
+
+
+# Keyed on the test seam as well as (pr, repo). That slot is permanently None in
+# production and exists for pytest, which is a real smell — it was reviewed as one
+# and the suggested remedy MEASURED as unworkable, so the reasoning is recorded
+# rather than the conclusion.
+#
+# The remedy proposed was an autouse fixture in tests/test_hooks/conftest.py
+# clearing the memo around every test, with the key narrowed to (pr, repo). It
+# cannot reach the cache: each test file builds its OWN `git_push_guard` object
+# via `importlib.util.spec_from_file_location` + `exec_module`, which does NOT
+# register in `sys.modules` (verified: `"git_push_guard" in sys.modules` is False
+# after that sequence). conftest has no handle on a per-file `guard_module`
+# fixture, so the clear is a silent no-op — and with the seam gone from the key,
+# tests reusing PR "100" under different `_TEST_GH_PR_FILES` values started
+# reading each other's fixtures. That surfaced as 23 failures whose message was
+# the off-diff lock firing, not a cache complaint, which is exactly how long this
+# would have taken to diagnose later.
+#
+# So the seam stays in the key. Removing it needs the module loading to change
+# first, in every test file that builds one.
+_PR_FILES_CACHE: dict[tuple[str, str | None, str | None], list[str] | None] = {}
+
+
+def _reset_pr_files_cache() -> None:
+    """Drop the memo. For tests; a hook process never needs it."""
+    _PR_FILES_CACHE.clear()
+
+
+def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """The real read. See :func:`_pr_changed_files` for the contract."""
     raw = os.environ.get("_TEST_GH_PR_FILES")
     if raw == "__error__":
         return None
@@ -4057,14 +4173,17 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
                 ],
                 capture_output=True,
                 text=True,
-                # Merge-path timeout budget (see main()): THREE consumers —
+                # Merge-path timeout budget (see main()): FOUR consumers —
                 # the hook-surface override check (rare override path),
-                # _pin_blob_unchanged (rare pin path), and the inline-findings
-                # diff scoping (#1728), which is on the hot merge path but
-                # LAZY: it reads only when a candidate blocking finding exists,
-                # at most once per scan. _gh_timeout clamps this call to the
-                # remaining merge deadline, and a timeout degrades to None →
-                # the scoping caller scores everything (status quo) + a NOTE.
+                # _pin_blob_unchanged (rare pin path), the inline-findings
+                # diff scoping (#1728), and the review LANE. The last two are on
+                # the hot merge path but LAZY: each reads only when a candidate
+                # blocking finding exists, and the memo in _pr_changed_files
+                # means all four share ONE underlying read per merge.
+                # _gh_timeout clamps this call to the remaining merge deadline,
+                # and a timeout degrades to None → the scoping caller scores
+                # everything (status quo) + a NOTE, and the lane fails closed to
+                # `critical`.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -4105,6 +4224,40 @@ def _pr_changed_files(pr_num: str, repo: str | None = None) -> list[str] | None:
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
     return files
+
+
+def _pr_lane(pr_num: str, repo: str | None = None) -> str:
+    """The consequence lane of PR *pr_num*: ``"critical" | "standard" | "light"``.
+
+    Settles the hook surface HERE — this module owns that fence — and delegates
+    the rest to ``review_scope.classify_lane``, the same split
+    ``_classify_post_review_delta`` already uses for substantiality.
+
+    FAIL-CLOSED twice over. An unreadable file list (``None``) and an import
+    failure both yield ``"critical"``, the strictest lane, so a change nobody can
+    classify is never given the benefit of a wider budget. That direction matters
+    more here than for substantiality, because the lane RELAXES a threshold: the
+    safe default is the one that relaxes nothing.
+    """
+    files = _pr_changed_files(pr_num, repo=repo)
+    if files is None:
+        return "critical"
+    try:
+        # review_scope lives in scripts/ (parent of scripts/hooks/). Lazy import ON
+        # PURPOSE and de-duped sys.path insert — the same idiom as
+        # _classify_post_review_delta, so a missing sibling degrades THIS
+        # classification rather than crashing the guard's module load and dropping
+        # every push/merge protection.
+        _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from review_scope import classify_lane
+    except Exception:  # noqa: BLE001 - unclassifiable is treated as consequential
+        return "critical"
+    try:
+        return classify_lane(files, hook_surface=any(_is_hook_surface_path(f) for f in files))
+    except Exception:  # noqa: BLE001 - same direction: never relax on an error
+        return "critical"
 
 
 def _hook_surface_override_check(pr_num: str, repo: str | None = None) -> tuple[bool, str]:

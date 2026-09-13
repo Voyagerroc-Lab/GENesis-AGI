@@ -3074,12 +3074,53 @@ The review-findings gate specifically:
    for automated review findings (ERROR, [P1], HARD BLOCK).
 2. If review present with **blocking findings** → merge is **BLOCKED**
    by the hook (exit code 2). Fix the findings first.
-3. Inline findings are SCORED and the gate blocks at score **>= 1.0**. THREE
-   things carry weight, and the third is missing from every prompt surface in
-   this repo — including, until 2026-09-10, this one:
-   **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR Major = 1.0 each**
-   (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`, `_CR_BLOCKING_WEIGHT = 1.0`).
-   So a lone Codex P2 is advisory (0.5), two block — and **a single CodeRabbit
+3. Inline findings are SCORED, and **SEVERITY FLOORS while the LANE governs
+   VOLUME.** Two independent rules, checked in that order:
+
+   **(a) The always-fix floor, every lane, before the score is consulted.** Any
+   unresolved Codex **P1**, or any unresolved CodeRabbit **Critical/Major**,
+   blocks the merge outright — whatever the change is. This is
+   `floor_hits = len(p1) + len(cr_block)` in `_check_inline_review_findings`.
+   It is a RULE because it used to be an ACCIDENT: before the lanes existed the
+   single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
+   arithmetic, unnamed and untested — and raising any threshold would have
+   deleted it in silence.
+
+   **(b) The per-lane score threshold, for everything below the floor.** Weights
+   are unchanged — **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR
+   Major = 1.0 each** (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`,
+   `_CR_BLOCKING_WEIGHT = 1.0`) — but what a change can AFFORD now depends on
+   what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`):
+
+   | lane | blocks at | what lands there |
+   |---|---|---|
+   | `critical` | **1.0** | enforcement-hook surface, `.github/**`, `api` or `migrations` paths |
+   | `standard` | **2.0** | ordinary runtime code |
+   | `light` | **3.0** | PROSE / tests / fixtures only, or vendored-only |
+
+   **`light` is PROSE, not `docs-config`.** A `.yaml`/`.toml`/`.ini`/`.cfg`
+   reaches `_category() == "docs-config"` through the shared classifier, but
+   config is not documentation — `config/desktop_takeover.yaml` arms desktop
+   takeover and `pyproject.toml` pins dependencies, so both are `standard`. The
+   light lane is `.md`/`.rst`/`.txt` and the known doc stems, plus tests and
+   fixtures (`review_scope._is_lane_light`). The first cut of this lane used the
+   whole `docs-config` category and handed config a 3.0 budget.
+
+   So on a CRITICAL change two P2s still block exactly as before; on ordinary
+   code it now takes four. MEASURED over the 40 most recently merged PRs:
+   critical 32.5%, standard 57.5%, light 10.0%. The lane comes from
+   `review_scope.classify_lane`, which FAILS CLOSED to `critical` on an
+   unreadable file list — the lane relaxes a threshold, so the safe default is
+   the one that relaxes nothing.
+
+   **`auth` is deliberately NOT a critical input**, though it sits in
+   `_DOMAIN_SENSITIVE_TAGS` and drives the depth gate. Its glob is
+   `*auth* *session* …`, and MEASURED over 3,999 tracked files, 58 of the 59
+   `auth`-tagged files (98%) match on **"session"** — CC-session machinery, not
+   authentication. Exactly one is real (`dashboard/auth.py`). Re-inheriting that
+   set is the obvious "cleanup"; don't.
+
+   One thing the lane does not change: **a single CodeRabbit
    Critical or Major blocks on its own, but ONLY from the INLINE endpoint.**
    `_check_inline_review_findings` reads two channels and they are NOT symmetric:
    `pulls/N/comments` (findings anchored inline) feeds the score, while the review
@@ -3189,14 +3230,18 @@ The review-findings gate specifically:
    `gh repo view --json nameWithOwner --jq .nameWithOwner` — NEVER hardcode
    it (configs name several repos; the working repo is not the org default).
    A **404 from that endpoint means WRONG SLUG or PR number, never "no
-   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on the
-   weighted inline SCORE (P1=1.0, P2=0.5; block at >= 1.0), so a lone P2 is
-   advisory but TWO unresolved P2s block — unread P2s no longer slip through in
-   pairs (2026-07-10: 8 real P2s on the entity-layer PRs merged past the OLD
-   P1-only gate, the exact gap this score closes). Note what it does NOT close,
-   and do not read it as more than it is: a LONE P2 still passes unread, which is
-   how #1620's HTTP-500 finding merged (2026-09-03). The score bounds what the
-   gate stops; only reading the report stops the rest. And the two
+   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on a P1 or a
+   CodeRabbit Critical/Major OUTRIGHT (the always-fix floor), and otherwise on the
+   weighted inline SCORE against this change's LANE threshold — so two unresolved
+   P2s block a CRITICAL change, while ordinary code takes four (full table in the
+   Pre-Merge Gate section above). Unread P2s no longer slip through in pairs on the
+   surface where that mattered (2026-07-10: 8 real P2s on the entity-layer PRs
+   merged past the OLD P1-only gate, the exact gap this score closes). Note what it
+   does NOT close, and do not read it as more than it is: a LONE P2 still passes
+   unread, which is how #1620's HTTP-500 finding merged (2026-09-03), and on an
+   ordinary change three now do. The score bounds what the gate stops; only reading
+   the report stops the rest — which is exactly why the gate prints a NOTE naming
+   the lane and threshold whenever a non-zero score passes under one. And the two
    channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
    ISSUE comment while a later `@codex review` trigger delivers real inline
    findings anyway — a quota message is evidence about that channel at that

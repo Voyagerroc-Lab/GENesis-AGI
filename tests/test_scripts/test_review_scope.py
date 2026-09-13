@@ -636,3 +636,87 @@ def test_compare_rename_docs_to_docs_still_inline():
     # A docs->docs rename (neither side reviewable code) stays inline.
     files = [_cf("docs/b.md", additions=150, status="renamed", previous_filename="docs/a.md")]
     assert _rs.classify_compare_substantiality(files) == "inline"
+
+
+# --------------------------------------------------------------------------- #
+# classify_lane — the CONSEQUENCE axis
+#
+# Orthogonal to substantiality: substantiality asks "is this big enough to need a
+# deep review", the lane asks "how much does it cost to be wrong". A one-line edit
+# to an enforcement hook is `inline` and `critical` at once.
+#
+# The hook-surface verdict is passed IN (its authority is git_push_guard's
+# constant), so these tests drive that parameter directly rather than duplicating
+# the fence.
+# --------------------------------------------------------------------------- #
+
+
+def test_lane_hook_surface_is_critical_however_small():
+    """A one-line guard edit outranks every other signal."""
+    assert _rs.classify_lane(["scripts/hooks/git_push_guard.py"], hook_surface=True) == "critical"
+
+
+def test_lane_github_config_is_critical():
+    """Not hook surface, but a change here can disable a required check as
+    effectively as editing a gate — the rationale in .github/labeler.yml."""
+    assert _rs.classify_lane([".github/workflows/ci.yml"], hook_surface=False) == "critical"
+
+
+def test_lane_api_and_migrations_are_critical():
+    assert _rs.classify_lane(["src/genesis/dashboard/routes/x.py"], hook_surface=False) == "critical"
+    assert _rs.classify_lane(["src/genesis/db/migrations/0001_x.py"], hook_surface=False) == "critical"
+
+
+def test_lane_auth_tag_is_NOT_critical():
+    """The `auth` glob is `*auth* *session* ...`, and this repo is built on CC
+    SESSIONS. MEASURED 2026-09-13 over 3,999 tracked files: 59 tag `auth` and 58
+    of them (98%) matched on "session" — session_cache.py, session_cap.py,
+    genesis_session_context.py. Inheriting `_DOMAIN_SENSITIVE_TAGS` wholesale
+    would make 58 session files critical for a reason nobody intended.
+
+    This test is the lock on that decision: re-adding `auth` to the lane's
+    sensitive set fails here, with this docstring as the reason.
+    """
+    assert _rs._scope_tag("src/genesis/cc/session_cache.py") == "auth", (
+        "precondition: this path must still hit the auth glob, or the test proves nothing"
+    )
+    assert _rs.classify_lane(["src/genesis/cc/session_cache.py"], hook_surface=False) == "standard"
+
+
+def test_lane_ordinary_code_is_standard():
+    assert _rs.classify_lane(["src/genesis/memory/store.py"], hook_surface=False) == "standard"
+
+
+def test_lane_docs_and_tests_only_is_light():
+    assert _rs.classify_lane(
+        ["docs/a.md", "tests/test_x.py", "CHANGELOG.md"], hook_surface=False
+    ) == "light"
+
+
+def test_lane_one_code_file_among_docs_is_not_light():
+    """The light lane is ALL-or-nothing: one real code file disqualifies it."""
+    assert _rs.classify_lane(["docs/a.md", "src/genesis/memory/store.py"], hook_surface=False) == (
+        "standard"
+    )
+
+
+def test_lane_unknown_scope_fails_CLOSED():
+    """An unreadable file list reaches us as []. The lane RELAXES a threshold, so
+    the safe default is the one that relaxes nothing."""
+    assert _rs.classify_lane([], hook_surface=False) == "critical"
+
+
+def test_lane_vendored_only_is_light():
+    """A lockfile refresh carries no reviewable code."""
+    assert _rs.classify_lane(["package-lock.json", "node_modules/x/y.js"], hook_surface=False) == (
+        "light"
+    )
+
+
+def test_lane_critical_beats_light_when_mixed():
+    """Guard the guard on ordering: a docs-heavy PR that also touches a migration
+    is critical, not light. The checks must not be order-dependent in the wrong
+    direction."""
+    assert _rs.classify_lane(
+        ["docs/a.md", "README.md", "src/genesis/db/migrations/0009_x.py"], hook_surface=False
+    ) == "critical"

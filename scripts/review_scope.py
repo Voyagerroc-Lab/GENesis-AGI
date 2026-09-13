@@ -643,6 +643,107 @@ def _classify_diff(diff_args: list[str], cwd: str | None) -> str:
     return _substantiality_level(_parse_name_status_z(name_status), per_file, binary)
 
 
+# ── review LANE — how much consequence a change carries ─────────────────────
+#
+# ORTHOGONAL to substantiality. Substantiality asks "is this big enough to need a
+# deep review"; the lane asks "how much does it cost to be wrong". A one-line edit
+# to an enforcement hook is `inline` and `critical` at once.
+#
+# WHY THE SENSITIVE SET IS ENUMERATED HERE rather than reusing
+# `_DOMAIN_SENSITIVE_TAGS`, which is the obvious "cleanup" a later reader will
+# attempt: that set includes `auth`, and in THIS repo the `auth` glob is a
+# name-substring heuristic dominated by `*session*`. MEASURED 2026-09-13 over 3,999
+# tracked files: 59 files tag `auth`, and **58 of them (98%) match on "session"** —
+# CC-session machinery like `session_cache.py` and `genesis_session_context.py`.
+# Exactly one is authentication (`dashboard/auth.py`). Inheriting that set would
+# make 58 session files `critical` for a reason nobody intended. `api` (57 files:
+# dashboard routes, dispatch router) and `migrations` (101) were measured clean.
+#
+# The `auth` glob remains in `_DOMAIN_SENSITIVE_TAGS`, where it already drives the
+# commit depth gate — a separate, pre-existing effect that is tracked on its own
+# issue, not silently changed from here.
+_LANE_SENSITIVE_TAGS = frozenset({"api", "migrations"})
+
+# The light lane is PROSE and test material — NOT config. A `.yaml`/`.toml`/
+# `.ini`/`.cfg` reaches `_category() == "docs-config"` through the shared
+# `_is_docs_or_config`, but config is not documentation: `config/
+# desktop_takeover.yaml` arms desktop takeover, `pyproject.toml` and
+# `requirements.txt` pin dependencies. Widening the lane to the whole
+# `docs-config` category handed all of those a 3.0 budget.
+#
+# The repo already learned this once, one layer up: `_HOOK_SURFACE_FILES` in
+# `scripts/hooks/git_push_guard.py` fences `config/protected_paths.yaml` and
+# `config/repo_topology.yaml` by hand, with the comment that "the ordinary
+# substantiality classifier treats YAML as docs/config (review-trivial)". That
+# fence covers ENFORCEMENT config only; this keeps the rest out of `light`
+# rather than extending the relaxation to it.
+_LANE_LIGHT_DOC_EXTS = frozenset({".md", ".rst", ".txt", ".markdown", ".adoc"})
+_LANE_LIGHT_DOC_STEMS = frozenset(
+    {"CHANGELOG", "README", "LICENSE", "NOTICE", "COPYING", "AUTHORS", "CONTRIBUTING"}
+)
+
+
+def _is_lane_light(path: str) -> bool:
+    """Prose, tests and fixtures — the material a wider finding budget suits."""
+    category = _category(path)
+    if category in ("test", "fixture"):
+        return True
+    if category != "docs-config":
+        return False
+    base = os.path.basename(path)
+    stem, _, ext = base.rpartition(".")
+    return (
+        f".{ext.lower()}" in _LANE_LIGHT_DOC_EXTS or (stem or base).upper() in _LANE_LIGHT_DOC_STEMS
+    )
+
+
+def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
+    """The consequence lane of a change: ``"critical" | "standard" | "light"``.
+
+    *hook_surface* is passed IN rather than computed here. The authority for that
+    membership is ``_is_hook_surface_path`` in ``scripts/hooks/git_push_guard.py``,
+    which owns the constant, its AST-diff tests and its two declared mirrors
+    (``.github/labeler.yml``, CODEOWNERS). This module must not import the guard —
+    it is deliberately dependency-free (see the module docstring) — and a second
+    copy of that fence here would be the drift those mirrors exist to prevent.
+    This mirrors what ``git_push_guard._classify_post_review_delta`` already does:
+    settle the hook surface first, then ask this module.
+
+    FAIL-CLOSED on an unknown scope. An empty *paths* means the caller could not
+    read the change (a failed API call reaches us as ``[]``), and a change nobody
+    can see is treated as consequential rather than waved through.
+
+    MEASURED over the 40 most recently merged PRs (2026-09-13): critical 32.5%,
+    standard 57.5%, light 10.0%. The bar, set before measuring, was that critical
+    stay at or under 50% — a lane that calls everything critical decides nothing.
+    """
+    if not paths:
+        return "critical"
+    if hook_surface:
+        # The caller's fence is an AUTHORITY, not a heuristic, so it is settled
+        # FIRST — ahead of the vendored short-circuit below, which would
+        # otherwise hand `light` to a hook file that happens to match a vendor
+        # glob. MEASURED: `scripts/hooks/generated/x.py` is both hook surface and
+        # `_is_vendored`, and alone in a PR it returned `light` when this check
+        # sat second. A contrived path today; a fence inversion in the one fence
+        # this design exists to protect.
+        return "critical"
+    reviewable = [p for p in paths if not _is_vendored(p)]
+    if not reviewable:
+        # Vendored-only: a lockfile refresh or a regenerated bundle.
+        return "light"
+    # `.github/` is not hook surface, but a change here can disable a required
+    # check as effectively as editing a gate — the rationale already written into
+    # `.github/labeler.yml`'s `ci-config` label.
+    if any(p.startswith(".github/") for p in reviewable):
+        return "critical"
+    if any(_scope_tag(p) in _LANE_SENSITIVE_TAGS for p in reviewable):
+        return "critical"
+    if all(_is_lane_light(p) for p in reviewable):
+        return "light"
+    return "standard"
+
+
 def classify_change_substantiality(cwd: str | None = None) -> str:
     """Substantiality of the STAGED change (--cached) — for the commit-time depth gate.
 
