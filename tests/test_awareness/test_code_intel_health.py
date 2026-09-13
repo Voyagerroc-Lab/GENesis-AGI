@@ -130,12 +130,15 @@ def test_a_healthy_install_is_silent(tmp_path):
     assert not ci.derive_findings(h), ci.derive_findings(h)
 
 
-def test_a_fresh_install_is_silent(tmp_path):
+def test_a_fresh_install_with_nothing_requested_is_silent(tmp_path):
     """No marker dir, no cache, nothing ever requested.
 
     A fresh clone has no index and that is CORRECT, not a fault — the check
     must distinguish "never asked" from "asked and failed". Absence of an index
     only speaks when something asked for one.
+
+    NOTE this is NOT what a real fresh install looks like; see the test below,
+    which is the one that matters. Kept as the degenerate control.
     """
     target = tmp_path / "repo"
     target.mkdir()
@@ -145,6 +148,105 @@ def test_a_fresh_install_is_silent(tmp_path):
         cache_dir=tmp_path / "no-such-cache",
     )
     assert not ci.derive_findings(h), ci.derive_findings(h)
+
+
+def _pending(markers: Path, repo: Path, *, age_s: float = 0.0) -> Path:
+    """A pending marker in the PRODUCER's shape, aged by `age_s`.
+
+    Built from index_marker's own field names rather than invented here, so the
+    fixture cannot drift into testing a queue shape that does not exist.
+    """
+    import time
+
+    p = markers / "0123456789abcdef.json"
+    p.write_text(
+        json.dumps(
+            {
+                "repo_path": str(repo),
+                "tools": "both",
+                "mode": "fast",
+                "requested_at": time.time() - age_s,
+                "attempts": 0,
+            }
+        )
+    )
+    return p
+
+
+def test_a_real_fresh_install_is_silent_while_its_first_index_is_queued(tmp_path):
+    """THE control that a `requested`-only rule fails.
+
+    A real fresh install is not "no markers" — `install.sh` and
+    `setup_claude_config.py` BOTH queue an index request at setup, so a healthy
+    new clone has a pending marker within seconds and no index for hours: the
+    runner is idle-gated and the first build is a full one. The earlier rule
+    ("absent AND anything ever asked") therefore fired a high alert on every
+    healthy install, under a remedy telling the operator to delete the pending
+    marker — which would have made the state permanent.
+    """
+    target = tmp_path / "repo"
+    target.mkdir()
+    markers = _markers(tmp_path)
+    _pending(markers, target, age_s=60)  # queued a minute ago
+
+    h = ci.collect(indexed_path=target, marker_dir=markers, cache_dir=_cache(tmp_path))
+    assert h.requested is True, "the marker should still be seen"
+    assert h.index_state == "absent"
+    assert not ci.derive_findings(h), ci.derive_findings(h)
+
+
+def test_a_pending_request_starved_past_the_relax_window_does_speak(tmp_path):
+    """The other direction, or the fix above would just be a mute button.
+
+    Once a request has waited longer than the runner's own relax window (after
+    which it indexes regardless of load), an absent index is a real fault.
+    """
+    target = tmp_path / "repo"
+    target.mkdir()
+    markers = _markers(tmp_path)
+    _pending(markers, target, age_s=ci._PENDING_GRACE_S + 3600)
+
+    h = ci.collect(indexed_path=target, marker_dir=markers, cache_dir=_cache(tmp_path))
+    findings = ci.derive_findings(h)
+    assert findings, "a starved pending request with no index must be reported"
+    assert "ABSENT" in findings[0]
+
+
+def test_a_tombstone_older_than_a_live_index_is_history_not_a_fault(tmp_path):
+    """`.failed.json` is written once and NEVER deleted by anything.
+
+    Meanwhile the request is recreated routinely (post-commit hook, the
+    twice-weekly gitnexus reindex, disk_reclaim), each resetting attempts to 0.
+    So a tombstone outlives the successful rebuild that answered it, and keying
+    the alarm on its existence re-pages "the indexer GAVE UP" about a repo
+    indexed hours earlier. Same defect already fixed for `.db.corrupt`.
+    """
+    target = tmp_path / "repo"
+    target.mkdir()
+    markers = _markers(tmp_path)
+    tomb = _euthanized(markers, str(target))
+    db = _index(_cache(tmp_path), target)
+    # The index was rebuilt AFTER the tombstone was written.
+    os.utime(tomb, (db.stat().st_mtime - 3600, db.stat().st_mtime - 3600))
+
+    h = ci.collect(indexed_path=target, marker_dir=markers, cache_dir=_cache(tmp_path))
+    assert h.index_state == "ok"
+    assert h.euthanized == [], h.euthanized
+    assert not ci.derive_findings(h), ci.derive_findings(h)
+
+
+def test_a_tombstone_newer_than_the_index_still_speaks(tmp_path):
+    """Both directions, or the rule above is indistinguishable from deleting it."""
+    target = tmp_path / "repo"
+    target.mkdir()
+    markers = _markers(tmp_path)
+    db = _index(_cache(tmp_path), target)
+    tomb = _euthanized(markers, str(target))
+    os.utime(tomb, (db.stat().st_mtime + 3600, db.stat().st_mtime + 3600))
+
+    h = ci.collect(indexed_path=target, marker_dir=markers, cache_dir=_cache(tmp_path))
+    assert h.euthanized, "a tombstone written after the last index is a live fault"
+    assert any("GAVE UP" in f for f in ci.derive_findings(h))
 
 
 def test_a_worktree_index_with_a_missing_root_is_out_of_scope(tmp_path):

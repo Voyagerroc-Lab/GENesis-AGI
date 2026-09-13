@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,6 +56,23 @@ _DEFAULT_CACHE = Path.home() / ".cache" / "codebase-memory-mcp"
 
 def _safe_path(value: object) -> str:
     return _PATH_UNSAFE.sub("?", str(value))
+
+
+#: How long a PENDING index request may wait before its unbuilt index counts as
+#: a fault. Deliberately longer than `code_intel_runner.sh`'s own
+#: RELAX_AFTER_S (86400s), after which the runner drops its idle gating and
+#: indexes regardless of load: this check must not accuse the runner of failing
+#: while it is still correctly waiting for a quiet moment. Two of those windows
+#: means it has had an unconstrained chance and produced nothing.
+_PENDING_GRACE_S = 2 * 86_400
+
+#: How many read failures are listed, and hashed into the alert identity. The
+#: sibling context-injection watcher bounds exactly this and says why: one entry
+#: per unreadable path, and the whole list goes into the identity, so an
+#: unbounded list is unbounded work AND a fresh identity — i.e. a re-page — for
+#: every additional unreadable file. The total is always stated, so the bound
+#: is an explicit omission rather than a silent cut.
+_MAX_LISTED_ERRORS = 3
 
 
 def index_slug(path: Path) -> str:
@@ -99,6 +117,19 @@ class CodeIntelHealth:
     #: index only means something when an index was requested — a fresh clone
     #: has neither, and that is correct, not a fault.
     requested: bool = False
+    #: Whether a request for this target reached a TERMINAL state (euthanized).
+    #: `requested` alone cannot carry the alarm: `install.sh` and
+    #: `setup_claude_config.py` both queue a marker at setup, so EVERY fresh
+    #: install has a pending request within seconds of existing. Treating that
+    #: as "something asked and the index is missing" fires a high alert on a
+    #: perfectly healthy new clone — the permanently-wrong-alarm class this
+    #: module exists to prevent, committed by the module itself.
+    requested_terminal: bool = False
+    #: Age in seconds of the OLDEST pending request naming this target, or None.
+    #: A pending request is work queued, not work failed: the runner is
+    #: idle-gated and only relaxes after RELAX_AFTER_S (86400s), so a young
+    #: pending request plus no index is the normal in-progress state.
+    pending_age_s: float | None = None
     #: Reads that FAILED. A check that cannot look must never read as all-clear.
     errors: list[str] = field(default_factory=list)
 
@@ -162,11 +193,37 @@ def collect(
         raw = str(data.get("repo_path", ""))
         return data if index_slug(Path(raw)) == target_slug else None
 
+    # The live index's mtime, read BEFORE the marker loops because a tombstone
+    # older than a working index is history, not a live fault. `.failed.json` is
+    # written once and NEVER deleted — enumerated, not spot-checked: the only
+    # writer is index_marker's euthanize path, and no unlink/rm of it exists
+    # anywhere in the repo. Meanwhile the request is recreated routinely (the
+    # post-commit hook, the twice-weekly gitnexus reindex, disk_reclaim), each
+    # time resetting attempts to 0. So a tombstone survives the successful
+    # rebuild that answered it, and keying the alarm on its mere existence is
+    # the SAME defect already fixed for `.db.corrupt` forty lines below —
+    # third instance of one class.
+    db_mtime: float | None = None
+    try:
+        db_mtime = (cache / f"{target_slug}.db").stat().st_mtime
+    except OSError:
+        db_mtime = None  # absent or unreadable; the index block below records it
+
     for entry in entries:
         data = _marker_data(entry)
         if data is None:
             continue
         health.requested = True
+        try:
+            if db_mtime is not None and entry.stat().st_mtime < db_mtime:
+                # A later request succeeded and rebuilt the index after this
+                # tombstone was written. Superseded — say nothing.
+                continue
+        except OSError as exc:
+            health.errors.append(
+                f"{_safe_path(entry)} could not be stat'd: {_safe_path(exc.strerror)}"
+            )
+        health.requested_terminal = True
         health.euthanized.append(
             {
                 "repo_path": _safe_path(data.get("repo_path", "")),
@@ -193,8 +250,25 @@ def collect(
         ]
     except OSError:
         pending = []  # an unreadable dir is already recorded above
-    if any(_marker_data(p) is not None for p in pending):
+    now = time.time()
+    for p in pending:
+        data = _marker_data(p)
+        if data is None:
+            continue
         health.requested = True
+        # `requested_at` is the marker's own field, preserved across coalescing
+        # as the EARLIEST request (index_marker.write_marker), which is exactly
+        # the clock we want: how long this target has been waiting, not when it
+        # was last touched. A malformed value must not read as "waiting
+        # forever", so an unusable one degrades to age 0 (in progress).
+        try:
+            age = now - float(data.get("requested_at", now))
+        except (TypeError, ValueError):
+            age = 0.0
+        age = max(age, 0.0)
+        health.pending_age_s = (
+            age if health.pending_age_s is None else max(health.pending_age_s, age)
+        )
 
     # ── the configured target's index ─────────────────────────────────────
     try:
@@ -230,9 +304,12 @@ def derive_findings(health: CodeIntelHealth) -> list[str]:
     findings: list[str] = []
 
     if health.errors:
+        listed = health.errors[:_MAX_LISTED_ERRORS]
+        omitted = len(health.errors) - len(listed)
         findings.append(
             "code-intel health check DEGRADED — "
-            + "; ".join(health.errors)
+            + "; ".join(listed)
+            + (f"; and {omitted} more read failures" if omitted else "")
             + ". It could not read everything it watches, so THIS READING CANNOT "
             "BE TREATED AS ALL-CLEAR."
         )
@@ -249,9 +326,25 @@ def derive_findings(health: CodeIntelHealth) -> list[str]:
             "(rc=143 means it was killed, usually under the memory cap)."
         )
 
-    # An absent index is only a fault if something ASKED for one; a fresh clone
-    # legitimately has neither, and alerting there would fire on every install.
-    if health.index_state == "corrupt" or (health.index_state == "absent" and health.requested):
+    # An absent index is only a fault if the request is DONE ASKING — either it
+    # was euthanized, or it has waited past the point where waiting is normal.
+    #
+    # "Something asked for one" is not enough, and the earlier version of this
+    # line proved it: `install.sh` and `setup_claude_config.py` each queue a
+    # marker at setup, so `requested` is True within seconds of a fresh clone
+    # existing, while the index legitimately takes hours — the runner is
+    # idle-gated and only relaxes after RELAX_AFTER_S (86400s), and the first
+    # build is a full one. That combination fired a high alert on every healthy
+    # new install, under a remedy telling the operator to delete the very
+    # pending marker that would eventually build the index. The grace window is
+    # deliberately LONGER than the runner's own relax window, so this speaks
+    # only once the runner has had its unconstrained chance and still produced
+    # nothing.
+    absent_is_a_fault = health.index_state == "absent" and (
+        health.requested_terminal
+        or (health.pending_age_s is not None and health.pending_age_s > _PENDING_GRACE_S)
+    )
+    if health.index_state == "corrupt" or absent_is_a_fault:
         findings.append(
             f"the code index for {health.target} is {health.index_state.upper()} — "
             "code-intelligence tools that read it are answering from nothing. "
@@ -270,11 +363,15 @@ def alert_identity(health: CodeIntelHealth) -> str:
     re-pages for a condition the operator has already seen is how the channel
     gets muted — which is precisely how this failure survived two weeks.
     """
-    repos = ",".join(sorted(e["repo_path"] for e in health.euthanized))
+    # De-duplicated: `index_slug` is many-to-one, so two markers can name paths
+    # that slug identically. Letting the same repo appear twice would put a
+    # COUNT back into a key whose whole purpose is to carry only the condition.
+    repos = ",".join(sorted({e["repo_path"] for e in health.euthanized}))
     return (
         f"target:{health.target}"
         f":index:{health.index_state}"
         f":requested:{'yes' if health.requested else 'no'}"
         f":euthanized:{repos}"
-        f":errors:{'|'.join(sorted(health.errors))}"
+        f":errors:{'|'.join(sorted(health.errors[:_MAX_LISTED_ERRORS]))}"
+        f":errcount:{'many' if len(health.errors) > _MAX_LISTED_ERRORS else len(health.errors)}"
     )

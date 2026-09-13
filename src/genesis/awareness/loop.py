@@ -1493,6 +1493,47 @@ async def _check_context_injection_health(db) -> None:
 _CODE_INTEL_SUPERSEDED_NOTE = "superseded by current code-intel index state"
 
 
+def _code_intel_headline(health) -> str:
+    """The headline must describe the state that was actually found.
+
+    `derive_findings` can return a list whose only member is the DEGRADED
+    finding — one unreadable marker file beside a perfectly healthy index. A
+    fixed "ANSWERING FROM NOTHING" prefix asserts an outage that did not happen,
+    which is the same class of false confidence as a silent failure, pointed the
+    other way.
+    """
+    if health.index_state != "ok" or health.euthanized:
+        return "CODE INTELLIGENCE IS ANSWERING FROM NOTHING — "
+    return "code-intel health check could not complete — "
+
+
+def _code_intel_recovery(health) -> str:
+    """Recovery text for the state actually found, never a fixed script.
+
+    The euthanized remedy ("clear the marker so the runner retries") is ACTIVELY
+    DESTRUCTIVE for a starved PENDING request: there is no euthanized marker to
+    clear, and deleting the pending one removes the only thing that would ever
+    cause the index to be built — turning a self-healing state into a permanent
+    one, on the instruction of the alert meant to repair it.
+    """
+    if health.euthanized:
+        return (
+            " Recovery: clear the euthanized marker in ~/.genesis/index-requests "
+            "so the runner retries (it is a terminal state — nothing retries it "
+            "on its own), then watch ~/.genesis/code-intelligence-runner.log. "
+        )
+    if health.index_state == "absent":
+        return (
+            " Recovery: the request is still PENDING and has waited past the "
+            "runner's own relax window, so the runner never found a window it "
+            "would act in — check that genesis-code-intel.timer is enabled and "
+            "that genesis-code-intel-freeze is not armed, then watch "
+            "~/.genesis/code-intelligence-runner.log. Do NOT delete the pending "
+            "marker: it is the only thing that will build the index. "
+        )
+    return " Watch ~/.genesis/code-intelligence-runner.log. "
+
+
 async def _check_code_intel_health(db) -> None:
     """Alert when the code index is dead, corrupt, or permanently abandoned.
 
@@ -1564,12 +1605,10 @@ async def _check_code_intel_health(db) -> None:
             source="code_intel_health_monitor",
             type="infrastructure_alert",
             content=(
-                "CODE INTELLIGENCE IS ANSWERING FROM NOTHING — "
+                _code_intel_headline(health)
                 + " | ".join(findings)
-                + " Recovery: clear the euthanized marker in "
-                "~/.genesis/index-requests so the runner retries (it is a "
-                "terminal state — nothing retries it on its own), then watch "
-                "~/.genesis/code-intelligence-runner.log. If it dies again with "
+                + _code_intel_recovery(health)
+                + "If it dies again with "
                 "rc=143 it is being killed under the memory cap: the indexed "
                 "path is decided by whoever WRITES the marker (post-commit hook, "
                 "disk_reclaim, the gitnexus surplus job — all repo-root), so "
