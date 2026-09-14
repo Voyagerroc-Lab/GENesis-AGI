@@ -1953,3 +1953,61 @@ async def test_raising_from_off_to_observe_records_the_new_mode(env, db_path, mo
     record = json.loads(w.last_run_path().read_text())
     assert record["mode"] == "observe"
     assert "stages" in record, "a running mode sweeps and measures again"
+
+
+async def test_a_failed_retirement_retries_on_a_SHORT_floor_not_the_full_interval(
+    env, db_path, monkeypatch
+):
+    """A retirement that fails must not strand the row for a whole interval.
+
+    The `observe` path ADVANCES the mode — this run swept and measured under
+    `observe`, so the record names the mode that actually ran — which means the
+    drop is not re-detected on the next trigger. The failure is carried in
+    `degraded` instead, and the next trigger retries it on the SHORT floor a
+    failed sweep gets rather than unconditionally: the retry re-runs the whole
+    sweep, so a persistently failing resolve must not replay it on every
+    session boundary.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.db.crud import observations as obs
+
+    monkeypatch.setattr(w, "effective_mode", lambda: "alert")
+    await _run(db_path)
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1
+
+    real = obs.resolve_by_source_and_type
+
+    async def _boom(db, **kw):
+        if kw.get("source") == w.ALERT_SOURCE:
+            raise RuntimeError("resolve exploded")
+        return await real(db, **kw)
+
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", _boom)
+    monkeypatch.setattr(w, "effective_mode", lambda: "observe")
+    out = await _run(db_path)
+
+    assert out["degraded"]["alert"] == "resolve_failed"
+    assert len(await _open_observations(db_path, w.ALERT_SOURCE)) == 1, "still standing"
+    record = json.loads(w.last_run_path().read_text())
+    assert record["mode"] == "observe", "the record names the mode that actually ran"
+    assert record["degraded"]["alert"] == "resolve_failed"
+
+    # Within the floor a non-forced trigger waits — the retry is BOUNDED.
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] == "debounced"
+
+    # Past the floor it RETRIES rather than waiting out the full interval.
+    record = json.loads(w.last_run_path().read_text())
+    record["computed_at"] = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    w.last_run_path().write_text(json.dumps(record))
+    monkeypatch.setattr(obs, "resolve_by_source_and_type", real)
+
+    out = await w.run_zero_drop_worker(
+        trigger="session_start", force=False, db_path=db_path, repo_path="/repo"
+    )
+    assert out["status"] != "debounced", "a pending retire must retry, not wait the interval"
+    assert await _open_observations(db_path, w.ALERT_SOURCE) == []
+    assert "alert" not in (json.loads(w.last_run_path().read_text())["degraded"] or {})

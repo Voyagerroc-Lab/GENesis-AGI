@@ -149,6 +149,25 @@ def _mode_change_note(prior_mode: object, mode: str) -> str:
     )
 
 
+def _retire_pending(prior: dict, mode: str) -> bool:
+    """Did a previous run record that it could not retire the alert it drops?
+
+    `observe` maintains no findings alert, so every observe sweep retires any
+    that stands; when that resolve FAILS the row stays up and the run records
+    ``degraded["alert"] = "resolve_failed"``. The next trigger must retry rather
+    than let the row sit until the 3-day TTL — but the retry re-runs the whole
+    sweep, so it is retried on the same SHORT floor a failed sweep gets instead
+    of unconditionally: a persistently failing resolve must not replay a
+    network-touching ~14-20s sweep on every session boundary, which is exactly
+    why ``FAILED_RETRY_FLOOR_MINUTES`` exists. The mode is NOT rolled back for
+    this case (unlike the `off` transition, which measured nothing): this run
+    swept and measured under `observe`, and the record names the mode that ran.
+    """
+    if mode != "observe":
+        return False
+    return (prior.get("degraded") or {}).get("alert") == "resolve_failed"
+
+
 # Display bound for one rendered identity. MEASURED on this install 2026-09-05:
 # 211 local branches, longest name 45 chars (p95 36); longest worktree path 114,
 # so the longest possible `@detached:<path>` identity is ~124. 160 clears every
@@ -1260,9 +1279,11 @@ async def _run_locked(
     # So the floor is derived from that cost rather than picked: at 5 minutes a
     # persistently failing detector spends under 7% of wall-clock sweeping,
     # while a transient fault still recovers in minutes instead of an hour.
+    # A pending findings-alert retirement retries on the same floor, for the
+    # same reason: the retry re-runs the whole sweep.
     debounce_minutes = (
         FAILED_RETRY_FLOOR_MINUTES
-        if prior.get("status") == "failed"
+        if prior.get("status") == "failed" or _retire_pending(prior, mode)
         else knob_int(cfg, "min_interval_minutes")
     )
     if not force and not dropped and _within_minutes(prior.get("computed_at"), debounce_minutes):
@@ -1542,6 +1563,11 @@ async def _run_locked(
                 db, source=ALERT_SOURCE, note=_mode_change_note(prior_mode, mode)
             )
             if alert_state == "resolve_failed":
+                # Recorded in `degraded`, which is ALSO the retry key: the next
+                # trigger re-detects it via `_retire_pending` and retries on the
+                # short floor instead of waiting out the interval. The mode is
+                # still advanced to `observe` — this run swept and measured
+                # under it, and the record's job is to name the mode that ran.
                 degraded["alert"] = alert_state
         # Blindness is reported in EVERY running mode: the lever governs egress
         # about findings, and a broken instrument is not a finding.
