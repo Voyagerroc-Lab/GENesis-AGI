@@ -1678,6 +1678,50 @@ class TestVerbPositionReachesTheGuard:
             f"means that number is wrong.\n{r.stdout}{r.stderr}"
         )
 
+    def test_a_visible_push_does_not_suppress_an_unresolved_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A parsed gated segment must not stand the net down for a DIFFERENT one.
+
+        The net's `not (push_segs or …)` exclusion is right for the RAW-TEXT
+        predicate: if the operation parsed, the ordinary gates own it, and
+        re-netting it would double-gate an already-published create. It is wrong
+        for a SEGMENT-level fact, because that fact is about another segment of
+        the same command — so pairing an unresolved force push with an ordinary
+        visible one stood the net down and the unreadable segment was never
+        inspected.
+
+        MEASURED pre-fix, both modes: the pair went BLOCK -> ASK interactively
+        while the unresolved push ALONE blocked, and the prompt it raised names
+        the VISIBLE push — so a human approving it is told about the wrong
+        command. Dispatched stayed BLOCK throughout, which is why the finding's
+        own "emits an overall allow" reading is not what this pins.
+
+        Uses the ORDINARY unpushed fixture on purpose. The finding framed the
+        bypass as riding the re-push allowlist; measured against the pre-fix
+        guard it reproduces identically on an unpublished branch, so that
+        condition is sufficient and not necessary.
+        """
+        cwd = _unpushed_repo(tmp_path, monkeypatch)
+
+        # GUARD THE GUARD: the visible push must be live and NOT already refused,
+        # or the pair below could block for a reason that has nothing to do with
+        # the unresolved segment. `ask` is the tell — and it is rc=0, the same
+        # exit code as an allow, so this must read the decision, never the code.
+        control = _run(_PUSH_GUARD, f"{GIT} {PUSH}", cwd=cwd)
+        assert _decision(control) == "ask", (
+            "the visible push was not merely prompted, so this fixture cannot "
+            f"show the pair being decided by it.\n{control.stdout}{control.stderr}"
+        )
+
+        cmd = f"{GIT} ${{ACTION:-{PUSH}}} {FORCE} origin main && {GIT} {PUSH}"
+        r = _run(_PUSH_GUARD, cmd, cwd=cwd)
+        assert _decision(r) == "block", (
+            "an unresolved force push rode a visible push: the net stood down "
+            "because SOME gated segment parsed, and the segment that could not "
+            f"be read was never inspected.\n{r.stdout}{r.stderr}"
+        )
+
     def test_a_hidden_verb_is_refused_outright_when_nobody_can_answer(self, tmp_path):
         """The dispatched leg refuses — and since 2026-09-08 so does the other.
 

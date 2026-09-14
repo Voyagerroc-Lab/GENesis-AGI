@@ -1664,6 +1664,37 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
 #:                                ``ls *.py``-shaped word in verb position for a hazard
 #:                                that also needs a planted file.
 #:
+#:   LEFT     a QUOTED or        `shlex` removes quotes before this check runs, so
+#:            ESCAPED verb word  ``git '$ACTION'`` and ``git pu\\{s,s\\}h`` are
+#:                               flagged although bash leaves both literal
+#:                               (VERIFIED through an argv-printing shim). An
+#:                               over-block, so the direction is safe.
+#:                               PRICED before deciding: MEASURED over 69,259 real
+#:                               commands, 12 git/gh segments are flagged at all and
+#:                               exactly ONE is flagged on a quoted word — and that
+#:                               one is ``gh pr "$M" --help``, which the row below
+#:                               already covers. Closing it needs the RAW quoting to
+#:                               survive into this check, and neither cheap route is
+#:                               sound: an INDEX into the raw tokens does not survive
+#:                               :func:`_strip_wrappers`, and matching by VALUE fails
+#:                               OPEN — in ``git $ACTION '$ACTION'`` the quoted twin
+#:                               would clear the active one. A structural change to
+#:                               this pipeline is not worth 1 in 69,259; a fail-open
+#:                               shortcut is not worth anything.
+#:   LEFT     a TERMINAL mode    ``git --help <topic>``, ``git --html-path`` and
+#:            (help / path)      ``gh --help pr <verb>`` cannot run an operation, but
+#:                               the walk below treats every option as something to
+#:                               skip and reaches the non-literal word after them, so
+#:                               a help query on a shell-built topic is refused.
+#:                               An over-block, and the only one here whose closure
+#:                               would be an OPEN SET: it needs a list of every git
+#:                               and gh mode that consumes the remaining words as
+#:                               documentation, which grows whenever those tools do.
+#:                               This module has already paid for enumerating another
+#:                               project's CLI once (see _RUN_CARRIER_VALUE_FLAGS),
+#:                               and the price of the residual is one refused help
+#:                               command against a list nobody can finish.
+#:
 #: A construct absent from both columns is UNEXAMINED, not covered. Add it to a
 #: column rather than assuming the columns are exhaustive.
 _EXPANSION_MARKS = ("$", "`")
@@ -1684,6 +1715,40 @@ _VERB_DISPATCHERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "git": (frozenset(_GIT_OPTS_WITH_ARG), frozenset()),
     "gh": (frozenset({"-R", "--repo"}), frozenset({"pr"})),
 }
+
+
+_BRACE_INT = re.compile(r"^[+-]?[0-9]+$")
+
+
+def _brace_range_expands(token: str, starts: list[int], end: int) -> bool:
+    """Whether ``{`` + the parts at *starts* + ``}`` at *end* is a bash RANGE.
+
+    Grammar MEASURED against bash through an argv-printing shim rather than read
+    off a manual, because the two disagree in both directions:
+
+        expands   {a..c} {1..3} {3..1} {a..a} {01..03} {-2..0} {+1..3} {A..c}
+                  {z..x} {1..9..2} {a..e..2} {1..3..-1} {1..3..01} {1..2..0}
+        literal   {foo..bar} {ab..cd} {a..bb} {1..a} {a..1} {..} {1..} {..3}
+                  {1..2..}
+
+    So both endpoints are integers (sign and leading zeros allowed), OR both are
+    exactly one ALPHABETIC character — `{1..a}` is literal, so "both single
+    characters" is not the rule. An increment must itself be an integer, and
+    ZERO is not special: `{1..2..0}` expands.
+
+    Slices are taken only for a real range candidate, and sibling groups cover
+    disjoint spans, so the slicing across a whole token sums to its length.
+    """
+    if not 2 <= len(starts) <= 3:
+        return False
+    bounds = [*starts, end + 2]  # +2 so the last part's `..` trim is uniform
+    parts = [token[bounds[k] : bounds[k + 1] - 2] for k in range(len(starts))]
+    if len(parts) == 3 and not _BRACE_INT.match(parts[2]):
+        return False  # `{1..2..x}` and `{1..2..}` are literal to bash
+    lo, hi = parts[0], parts[1]
+    if _BRACE_INT.match(lo) and _BRACE_INT.match(hi):
+        return True
+    return len(lo) == 1 and len(hi) == 1 and lo.isalpha() and hi.isalpha()
 
 
 def _has_brace_expansion(token: str) -> bool:
@@ -1724,20 +1789,44 @@ def _has_brace_expansion(token: str) -> bool:
     the innermost open group is the one a separator belongs to — which is exactly
     the nesting rule above, expressed without a second traversal.
     """
-    stack: list[bool] = []
+    # FLAT containers, one set for the whole scan. Not a per-group object: the
+    # cost probe scans tens of thousands of unterminated `{`, and an object plus
+    # a list per opener is that many GC-tracked allocations — measured as a
+    # linearity failure even though the algorithm is linear. bytearrays are not
+    # GC-tracked at all.
+    comma = bytearray()
+    nested = bytearray()
+    base: list[int] = []
+    starts: list[int] = []
     i, n = 0, len(token)
     while i < n:
         c = token[i]
         if c == "{":
-            stack.append(False)
+            if comma:
+                nested[-1] = 1
+            comma.append(0)
+            nested.append(0)
+            base.append(len(starts))
+            starts.append(i + 1)
         elif c == "}":
-            if stack and stack.pop():
-                return True  # this group expands, so the whole word does
-        elif stack:  # a separator belongs to the INNERMOST open group
+            if comma:
+                had_comma = comma.pop()
+                had_nested = nested.pop()
+                first = base.pop()
+                if had_comma:
+                    return True  # this group expands, so the whole word does
+                # A nested group's braces sit inside this group's text, and no
+                # valid endpoint contains one — so a range cannot survive
+                # nesting. bash agrees: `{a..{b,c}}` expands through the INNER
+                # comma, which that group already reported, not through this `..`.
+                if not had_nested and _brace_range_expands(token, starts[first:], i):
+                    return True
+                del starts[first:]
+        elif comma:  # a separator belongs to the INNERMOST open group
             if c == ",":
-                stack[-1] = True
+                comma[-1] = 1
             elif c == "." and i + 1 < n and token[i + 1] == ".":
-                stack[-1] = True
+                starts.append(i + 2)
                 i += 1
         i += 1
     return False  # openers never closed — bash leaves them alone, so do we

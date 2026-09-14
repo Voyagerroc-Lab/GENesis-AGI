@@ -167,6 +167,37 @@ def _brace_cost(n: int, reps: int = 5) -> float:
     return sorted(samples)[len(samples) // 2]
 
 
+#: Brace forms with bash's own verdict, MEASURED through a shim that prints its
+#: argv. Kept as data because the interesting rows are the ones nobody would
+#: guess: `{1..2..0}` expands, `{1..a}` does not, `{A..c}` yields 35 words.
+_BRACE_EXPANDS = [
+    "{a..c}", "{1..3}", "{3..1}", "{a..a}", "{01..03}", "{-2..0}", "{+1..3}",
+    "{1..+3}", "{A..c}", "{z..x}", "{1..9..2}", "{a..e..2}", "{1..3..-1}",
+    "{1..3..01}", "{1..2..0}", "{a,b}", "{{a,b}}", "{a..{b,c}}", "pus{h..h}",
+    "pu{s,s}h",
+]
+_BRACE_LITERAL = [
+    "{foo..bar}", "{ab..cd}", "{a..bb}", "{1..a}", "{a..1}", "{..}", "{1..}",
+    "{..3}", "{1..2..x}", "{1..2..}", "{a}", "{}", "plain", "{unclosed", "a{b}c",
+]
+
+
+@pytest.mark.parametrize("word", _BRACE_EXPANDS)
+def test_a_word_bash_expands_is_reported(word):
+    """The half a narrowing fix can silently destroy. Without these, a change
+    that stopped reporting everything would satisfy the over-block finding and
+    delete the rule it belongs to."""
+    assert sp._has_brace_expansion(word) is True, word
+
+
+@pytest.mark.parametrize("word", _BRACE_LITERAL)
+def test_a_word_bash_leaves_literal_is_not_reported(word):
+    """The over-block this closes: any top-level `..` used to count as a range,
+    so `git {foo..bar}` — which bash passes through untouched — was routed to the
+    blind-spot net and refused."""
+    assert sp._has_brace_expansion(word) is False, word
+
+
 def test_the_brace_scan_cost_is_linear_in_word_length():
     """The durable property is the SHAPE, so this asserts a ratio, not a constant.
 

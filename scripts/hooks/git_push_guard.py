@@ -7923,10 +7923,28 @@ def _run_merge_and_push_gates() -> int:
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
         hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
-        if (
-            not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-            and blind is not None
-            and (_mentions_gated_op(cmd) or hidden_gated_verb)
+        # The two predicates are NOT suppressed by the same thing, and collapsing
+        # them into one `not (…parsed…)` guard was the defect.
+        #
+        # `_mentions_gated_op` reads the RAW TEXT, so a parsed gated segment
+        # EXPLAINS the mention — the ordinary gates own that operation and
+        # re-netting it would double-gate an already-published create. Its
+        # exclusion is right and stays.
+        #
+        # `hidden_gated_verb` is a fact about a SPECIFIC segment, and a different
+        # segment parsing says nothing about it. Suppressing it that way let an
+        # unresolved publish ride a visible one: MEASURED on the merged tree,
+        # `git ${ACTION:-push} --force origin main && git push` on a published
+        # branch went BLOCK -> ASK interactively (dispatched stayed BLOCK), and
+        # the prompt it raised names the VISIBLE push — so a human approving it
+        # is told about the wrong command. The multiple-publish rejection is
+        # skipped too, since only one segment parses as a push.
+        if blind is not None and (
+            hidden_gated_verb
+            or (
+                not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+                and _mentions_gated_op(cmd)
+            )
         ):
             # Defer the syntax refusal so specific sqlite/no-verify blocks keep
             # their sharper diagnostics. Bounds keep main's immediate refusal.
