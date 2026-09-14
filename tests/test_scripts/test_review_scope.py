@@ -845,19 +845,18 @@ def test_the_prose_vocabulary_mirrors_the_guards_doc_vocabulary():
     the guard-vs-doc_paths pair the same way; this closes the third edge, so `.adoc`
     cannot be added to one side while the lane and the doc-findings filter start
     disagreeing about what prose is.
+
+    Loaded via `private_module` rather than a hand-rolled register/exec/restore.
+    This test originally did the latter, and the two changes met in a way neither
+    diff showed: the shared helper landed on main and removed this file's
+    `import importlib.util`, while this branch added a USE of it. The hunks are
+    far apart, so git merged both cleanly and CI failed on an undefined name that
+    exists in neither branch alone.
     """
-    spec = importlib.util.spec_from_file_location(
-        "_gpg_for_prose_parity", _SCRIPTS / "hooks" / "git_push_guard.py"
-    )
-    guard = importlib.util.module_from_spec(spec)
-    sys.modules["_gpg_for_prose_parity"] = guard
-    try:
-        spec.loader.exec_module(guard)
-        assert {e.lstrip(".") for e in _rs._LANE_PROSE_EXTS} == guard._DOC_EXTS
-        assert {s.lower() for s in _rs._LANE_PROSE_STEMS} == guard._DOC_STEMS
-        assert {e.lstrip(".") for e in _rs._LANE_PROSE_STEM_EXTS} == guard._DOC_STEM_EXTS
-    finally:
-        sys.modules.pop("_gpg_for_prose_parity", None)
+    guard = private_module("_gpg_for_prose_parity", _SCRIPTS / "hooks" / "git_push_guard.py")
+    assert {e.lstrip(".") for e in _rs._LANE_PROSE_EXTS} == guard._DOC_EXTS
+    assert {s.lower() for s in _rs._LANE_PROSE_STEMS} == guard._DOC_STEMS
+    assert {e.lstrip(".") for e in _rs._LANE_PROSE_STEM_EXTS} == guard._DOC_STEM_EXTS
 
 
 def test_lane_config_is_ORDINARY_not_critical():
