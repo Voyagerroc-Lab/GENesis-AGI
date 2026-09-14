@@ -738,61 +738,99 @@ def test_every_route_defining_module_is_critical():
     )
 
 
-def test_no_non_HTTP_module_is_dragged_into_critical():
-    """The OTHER direction, which the enumeration above is structurally blind to.
+def test_required_check_implementations_are_critical():
+    """A required check's IMPLEMENTATION is the same consequence surface as the
+    workflow that invokes it — and the list is DERIVED, not remembered.
 
-    `test_every_route_defining_module_is_critical` measures misses. It cannot see
-    over-classification, so it stayed green across a round in which the `*route*`
-    NAME glob pulled 7 non-HTTP modules into the strictest lane — the LLM router,
-    the dispatch router, the reflection output router. A reviewer found that; this
-    suite could not, because a rate measured on one side of a tradeoff is half a
-    measurement.
+    `.github/**` was critical from the first version of this lane, on the stated
+    reason that a change there can disable a required check. The implementation
+    disables it just as effectively, and for three rounds only the YAML layer was
+    covered: MEASURED, all 15 scripts `ci.yml` invokes took the standard
+    threshold, so three unresolved P2s passed in the leak scanner or the
+    review-depth gate where two would have blocked in the workflow calling them.
 
-    The pair is the point: misses above, false positives here. A future rule that
-    widens the critical set by name rather than by boundary fails one or the other.
+    Derived from `ci.yml` ON PURPOSE. A hardcoded list is the shape that went
+    stale three times in this file; re-parsing the workflow means a required
+    check added next month fails HERE until someone puts its path in the lane's
+    vocabulary, which is the only version of this that survives its author.
     """
     root = Path(__file__).resolve().parents[2]
-    pat = re.compile(r"^\s*@\w+\.route\(|Blueprint\(|add_url_rule\(", re.M)
-    tracked = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "*.py"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
+    workflow = root / ".github" / "workflows" / "ci.yml"
+    assert workflow.exists(), "precondition: the required-CI workflow is where we think"
+
+    invoked = sorted(
+        {
+            m.lstrip("./")
+            for m in re.findall(
+                r"(?:python3?|bash) +((?:\./)?scripts/[A-Za-z0-9_/.-]+\.(?:py|sh))",
+                workflow.read_text(),
+            )
+        }
+    )
+    assert len(invoked) >= 10, (
+        f"precondition: expected the workflow to invoke many checkers, found "
+        f"{len(invoked)} — if the invocation SPELLING changed, this test is "
+        f"measuring nothing and must be updated before it is trusted"
+    )
+
+    missed = [p for p in invoked if _rs.classify_lane([p], hook_surface=False) != "critical"]
+    assert not missed, (
+        f"{len(missed)} of {len(invoked)} required-check implementations are "
+        f"outside the critical lane — changing them disables enforcement as "
+        f"effectively as editing the workflow: {missed}"
+    )
+
+
+def test_the_explicit_rules_FULLY_EXPLAIN_the_critical_set():
+    """Nothing may reach `critical` for a reason the module does not state.
+
+    This is the lock on the defect that survived two rounds: `_scope_tag` — a
+    NAME vocabulary living outside this module — pulled 7 non-HTTP files into the
+    strictest lane (`routing/router.py` is the LLM router). The enumeration test
+    above could not see it, because it measures MISSES and that was the opposite
+    direction.
+
+    Stated as a STRUCTURAL property rather than an exemption list: re-derive the
+    critical set from the declared constants alone and require it to equal what
+    `classify_lane` actually produces. An exemption list would be a second copy
+    of those constants, and a drifting replica is the shape this file keeps
+    finding defects in. If the two sets ever disagree, something outside
+    `_LANE_CRITICAL_*` is classifying — which is exactly how the tag crept back
+    in twice.
+    """
+    root = Path(__file__).resolve().parents[2]
+    tracked = [
+        f
+        for f in subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        if not f.startswith("tests/")
+    ]
     assert len(tracked) > 500, "precondition: ls-files returned a plausible population"
 
-    offenders = []
-    for f in tracked:
-        if f.startswith("tests/"):
-            continue
-        if _rs.classify_lane([f], hook_surface=False) != "critical":
-            continue
-        text = (root / f).read_text(errors="ignore")
-        if pat.search(text):
-            continue  # a real HTTP surface — belongs there
-        # Schema, CI and credential surfaces are critical for reasons that have
-        # nothing to do with routes; they are named by boundary, so exempt them by
-        # the SAME boundary rather than by guessing from the filename.
-        if f.startswith(
-            (
-                ".github/",
-                "src/genesis/db/migrations/",
-                "src/genesis/db/data_migrations/",
-                "src/genesis/dashboard/routes/",
-                "src/genesis/hosting/",
-            )
-        ):
-            continue
-        if os.path.basename(f) in _rs._LANE_CRITICAL_BASENAMES:
-            continue
-        if os.path.basename(f).startswith(_rs._LANE_CRITICAL_BASENAME_PREFIXES):
-            continue
-        offenders.append(f)
+    def declared(path: str) -> bool:
+        """The critical rules, re-expressed from the module's own constants."""
+        if any(path.startswith(pre) for pre in _rs._LANE_CRITICAL_PREFIXES):
+            return True
+        base = os.path.basename(path)
+        if base in _rs._LANE_CRITICAL_BASENAMES:
+            return True
+        return base.endswith(_rs._LANE_CRITICAL_BASENAME_EXTS) and base.startswith(
+            _rs._LANE_CRITICAL_BASENAME_PREFIXES
+        )
 
-    assert not offenders, (
-        f"{len(offenders)} module(s) reach the critical lane without defining an "
-        f"HTTP route or sitting on a declared consequence boundary — the "
-        f"over-classification shape: {offenders}"
+    unexplained = [
+        f
+        for f in tracked
+        if _rs.classify_lane([f], hook_surface=False) == "critical" and not declared(f)
+    ]
+    assert not unexplained, (
+        f"{len(unexplained)} file(s) reach the critical lane without matching any "
+        f"declared rule — something outside _LANE_CRITICAL_* is classifying, which "
+        f"is the shape that put the LLM router in the strictest lane: {unexplained}"
     )
 
 

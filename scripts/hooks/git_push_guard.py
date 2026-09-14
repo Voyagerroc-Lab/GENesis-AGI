@@ -1053,7 +1053,10 @@ _CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # path, so there is one score and one threshold to reason about.
 _CR_BLOCKING_WEIGHT = 1.0
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
-# is half (0.5), so the gate blocks at any unresolved P1 OR >= 2 unresolved P2s.
+# is half (0.5). What that BUYS depends on the lane: see the per-lane thresholds
+# below. Two P2s block a `critical` change, four a `standard` one, six a `light`
+# one. The flat "any P1 OR >= 2 P2s" this line used to state is now true only in
+# the critical lane.
 # Doc-path and maintainer-replied (consciously-accepted) findings are excluded
 # from the score, exactly as for P1s. Fixed policy value that works on any clone —
 # deliberately not per-install configurable.
@@ -2178,8 +2181,11 @@ def _check_inline_review_findings(
 
 
     Returns (should_block, message). Each unresolved finding contributes to a review
-    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score >= 1.0 (any P1, OR
-    >= 2 P2s). A finding is EXCLUDED from the score when its thread has a MAINTAINER
+    score — P1 = 1.0, P2 = 0.5 — and the gate blocks when the score reaches the
+    threshold FOR THIS PR'S LANE (`_INLINE_SCORE_BLOCK_THRESHOLDS`): critical 1.0,
+    standard 2.0, light 3.0. So two P2s stop a consequence surface, four ordinary
+    code, six prose-and-tests. A P1 blocks in EVERY lane via the always-fix floor,
+    before the score is consulted at all. A finding is EXCLUDED from the score when its thread has a MAINTAINER
     reply (engagement = consciously accepted), its path is documentation
     (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
     merge of main stamps base-branch findings onto the PR; scoring them makes
@@ -2633,7 +2639,9 @@ def _check_inline_review_findings(
         for title in doc_skipped_p2[:5]:
             print(f"  [doc P2] {title}", file=sys.stderr)
     # Weighted review score: P1 = 1.0 (full blocker), P2 = 0.5. Blocks at
-    # score >= threshold — any unresolved P1, OR >= 2 unresolved P2s. Doc-path
+    # score >= the LANE's threshold (critical 1.0 / standard 2.0 / light 3.0), so
+    # the P2 count that stops a merge is 2, 4 or 6 respectively. A P1 never
+    # reaches here — the always-fix floor above blocks it in every lane. Doc-path
     # and maintainer-replied findings were already excluded from p1/p2 above.
     # The REVIEW-BODY channel contributes NOTHING to this sum, at any severity.
     # It is surfaced and never scored — owner decision at the escalation cap,
@@ -8845,7 +8853,8 @@ def _run_merge_and_push_gates() -> int:
 
                 # Inline review comments (Codex P1/P2 badges) — separate
                 # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
-                # blocks at >= 1.0 (any P1, or 2+ unresolved P2s).
+                # blocks at the LANE's threshold (critical 1.0 / standard 2.0 /
+                # light 3.0), with any P1 blocking in every lane via the floor.
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,

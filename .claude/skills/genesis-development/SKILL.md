@@ -3114,7 +3114,7 @@ The review-findings gate specifically:
 
    | lane | blocks at | what lands there |
    |---|---|---|
-   | `critical` | **1.0** | enforcement-hook surface, `.github/**`, `api`/`migrations`-tagged paths, and modules named `api.py` / `api_*.py` |
+   | `critical` | **1.0** | enforcement-hook surface · `.github/**` AND the implementations behind its required checks (`scripts/ci/**`, `check_*.py`/`.sh`) · schema and data migrations · HTTP surfaces (`dashboard/routes/**`, `hosting/**`, `api.py`/`api_*`, `_blueprint.py`) · secrets and credentials |
    | `standard` | **2.0** | ordinary runtime code |
    | `light` | **3.0** | PROSE (including prompt surfaces) / tests / fixtures only, or vendored-only |
 

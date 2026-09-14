@@ -687,7 +687,19 @@ _LANE_CRITICAL_PREFIXES = (
     "src/genesis/db/data_migrations/",  # data; MISSED by the inherited glob
     "src/genesis/dashboard/routes/",  # HTTP surface
     "src/genesis/hosting/",  # HTTP servers: /genesis/login, /v1/chat/completions
+    "scripts/ci/",  # implementations behind required checks — see below
 )
+
+# `.github/**` is critical because a change there can disable a required check.
+# The IMPLEMENTATION behind that check disables it just as effectively, and until
+# this was added only the YAML layer was protected: MEASURED, all 15 scripts
+# `ci.yml` actually invokes — the leak scanner, the private-pattern scan, the
+# migration-prefix check, the review-depth gate — took the standard threshold,
+# so three unresolved P2s passed in a leak scanner where two would have blocked
+# in the workflow that merely calls it. Covered by `scripts/ci/` above plus the
+# `check_` basename prefix below; `test_required_check_implementations_are_critical`
+# re-derives the invocation list from `ci.yml` so a required check added later
+# fails that test until its path is covered here.
 
 
 # THE LANE CONSULTS NO `_scope_tag` VALUE AT ALL, and the third attempt at this
@@ -724,11 +736,30 @@ _LANE_CRITICAL_PREFIXES = (
 #: `_blueprint.py` is here rather than in the prefixes because it is a route
 #: registrar that lives beside ordinary dashboard code — see the enumeration test.
 _LANE_CRITICAL_BASENAMES = frozenset(
-    {"api.py", "auth.py", "secrets.py", "credentials.py", "_blueprint.py"}
+    {
+        "api.py",
+        "auth.py",
+        "secrets.py",
+        "credentials.py",
+        "_blueprint.py",
+        # Required-check implementation that matches no prefix below.
+        "assemble_changelog.py",
+    }
 )
 
-#: Basename PREFIXES, with `.py` required, for the same reason.
-_LANE_CRITICAL_BASENAME_PREFIXES = ("api_", "auth_")
+#: Basename PREFIXES, on an executable extension. `.sh` counts as well as `.py`
+#: because two required checks are shell (`check_portability.sh`,
+#: `check_hook_versions_complete.sh`) — restricting this to `.py` would have left
+#: them behind exactly the way the YAML-only boundary left all 15 behind.
+#:
+#: MEASURED both directions before adding `check_`: the rules cover 15 of 15
+#: scripts `ci.yml` invokes with ZERO misses, and match 4 further tracked files
+#: that CI does not invoke — `check_cc_running_versions.sh`, `check_hook_versions.sh`,
+#: `check_stale_pending.py`, `scripts/ci/cc_pin_parse.py`. Those four are checkers
+#: and CI helpers themselves, i.e. the same KIND of surface, which is what makes
+#: this a boundary rather than the `*route*` shape that matched the LLM router.
+_LANE_CRITICAL_BASENAME_PREFIXES = ("api_", "auth_", "check_")
+_LANE_CRITICAL_BASENAME_EXTS = (".py", ".sh")
 
 #: Prose. `.txt` is NOT prose on its own — `requirements.txt` and
 #: `config/az-pip-constraints.txt` are dependency pins — so it counts only on a
@@ -766,7 +797,9 @@ def _is_lane_critical_path(path: str) -> bool:
     base = os.path.basename(path)
     if base in _LANE_CRITICAL_BASENAMES:
         return True
-    return base.endswith(".py") and base.startswith(_LANE_CRITICAL_BASENAME_PREFIXES)
+    return base.endswith(_LANE_CRITICAL_BASENAME_EXTS) and base.startswith(
+        _LANE_CRITICAL_BASENAME_PREFIXES
+    )
 
 
 def _is_lane_light(path: str) -> bool:
