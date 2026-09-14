@@ -740,6 +740,47 @@ def test_every_route_defining_module_is_critical():
     )
 
 
+def _ci_invoked_scripts(workflow: Path) -> list[str]:
+    """Every `scripts/...` path the workflow EXECUTES, from its `run:` blocks.
+
+    Parsed from the YAML rather than regexed over the raw file, because the two
+    failure directions pull against each other and a flat regex loses both:
+
+      * TOO NARROW — the first version matched only `python3?|bash` followed
+        immediately by the path, so `python -u scripts/x.py`, `bash -e scripts/x.sh`
+        and a direct `./scripts/x.sh` all slipped past. A required check added in
+        any of those forms would never enter this list, and the count precondition
+        would not notice because the other 15 still matched.
+      * TOO BROAD — matching bare paths anywhere in the file picks up mentions in
+        COMMENTS (`scripts/genesis_mcp_server.py`, `scripts/lib/cc_version.sh` are
+        both named in prose here). Neither is a consequence surface, so a broad
+        matcher would demand they be critical and fail for the wrong reason.
+
+    Restricting to `run:` blocks separates the two: only executed text is
+    considered, and within it both interpreter-with-flags and direct execution.
+    """
+    import yaml
+
+    doc = yaml.safe_load(workflow.read_text())
+    runs: list[str] = []
+    for job in (doc.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and isinstance(step.get("run"), str):
+                runs.append(step["run"])
+
+    invoked: set[str] = set()
+    # An interpreter, any number of its own flags, then the script.
+    interp = re.compile(
+        r"\b(?:python3?|bash|sh)\b(?:\s+-[^\s]+)*\s+((?:\./)?scripts/[A-Za-z0-9_/.-]+\.(?:py|sh))"
+    )
+    # Or the script executed directly.
+    direct = re.compile(r"(?:^|\s)(\./scripts/[A-Za-z0-9_/.-]+\.(?:py|sh))")
+    for text in runs:
+        invoked.update(m.lstrip("./") for m in interp.findall(text))
+        invoked.update(m.lstrip("./") for m in direct.findall(text))
+    return sorted(invoked)
+
+
 def test_required_check_implementations_are_critical():
     """A required check's IMPLEMENTATION is the same consequence surface as the
     workflow that invokes it — and the list is DERIVED, not remembered.
@@ -760,15 +801,7 @@ def test_required_check_implementations_are_critical():
     workflow = root / ".github" / "workflows" / "ci.yml"
     assert workflow.exists(), "precondition: the required-CI workflow is where we think"
 
-    invoked = sorted(
-        {
-            m.lstrip("./")
-            for m in re.findall(
-                r"(?:python3?|bash) +((?:\./)?scripts/[A-Za-z0-9_/.-]+\.(?:py|sh))",
-                workflow.read_text(),
-            )
-        }
-    )
+    invoked = _ci_invoked_scripts(workflow)
     assert len(invoked) >= 10, (
         f"precondition: expected the workflow to invoke many checkers, found "
         f"{len(invoked)} — if the invocation SPELLING changed, this test is "
@@ -781,6 +814,85 @@ def test_required_check_implementations_are_critical():
         f"outside the critical lane — changing them disables enforcement as "
         f"effectively as editing the workflow: {missed}"
     )
+
+
+def test_the_extractor_sees_every_invocation_form():
+    """Guard the guard on the EXTRACTOR, not just on its current output.
+
+    The lock above is only as good as what it can see, and its first version was
+    measurably blind: `python -u`, `bash -e` and `./scripts/x.sh` all went
+    unnoticed while the count stayed at 15, so the precondition could not fire
+    either. A reviewer found that; nothing here could have.
+
+    Synthetic workflow rather than the live one, so this keeps testing the
+    extractor after `ci.yml` changes — and it asserts the NEGATIVE case too,
+    because the naive fix for the blind spot (match bare paths anywhere) picks up
+    comment-only mentions and fails for the wrong reason.
+    """
+    import textwrap
+
+    wf = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+    assert wf.exists(), "precondition: real workflow present for the live test above"
+
+    import tempfile
+
+    synthetic = textwrap.dedent(
+        """\
+        jobs:
+          probe:
+            steps:
+              - run: python -u scripts/flagged_interp.py
+              - run: bash -e scripts/flagged_shell.sh
+              - run: ./scripts/direct_exec.sh
+              - run: python3 scripts/plain.py
+              - run: |
+                  # scripts/only_a_comment.py is named but never run
+                  echo done
+        """
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as fh:
+        fh.write(synthetic)
+        tmp = Path(fh.name)
+    try:
+        found = _ci_invoked_scripts(tmp)
+    finally:
+        tmp.unlink()
+
+    assert "scripts/flagged_interp.py" in found, "interpreter flags must not hide a checker"
+    assert "scripts/flagged_shell.sh" in found, "shell flags must not hide a checker"
+    assert "scripts/direct_exec.sh" in found, "direct execution must not hide a checker"
+    assert "scripts/plain.py" in found
+    assert "scripts/only_a_comment.py" not in found, (
+        "a path mentioned in a comment is not an invocation — matching it would "
+        "demand the critical lane for files that are not consequence surfaces"
+    )
+
+
+def test_a_fixture_corpus_is_light_even_when_it_looks_like_source():
+    """Sample programs the eval harness loads as DATA are not consequence surfaces.
+
+    MEASURED: 19 tracked files under `gauntlet_fixtures/` split standard 15 /
+    critical 1 / light 3, and the CRITICAL one was `calc_longhorizon/calc/api.py`
+    — dragged in by THIS module's own `api.py` basename rule. A sample program in
+    the strictest lane is the same over-classification shape as the `*route*`
+    glob, self-inflicted this time.
+
+    The exemption is the one rule here that makes a change LIGHTER, so it is
+    anchored as a directory PREFIX and the negative case is asserted: a sibling
+    directory whose name merely STARTS with the exempt one must not inherit it.
+    A substring or `*fixture*` spelling would exempt every continuation, which is
+    how a loosening rule widens a budget by accident.
+    """
+    real = "src/genesis/eval/gauntlet_fixtures/calc_longhorizon/calc/api.py"
+    assert _rs.classify_lane([real], hook_surface=False) == "light"
+
+    # Controls, both directions.
+    assert _rs.classify_lane(["src/genesis/outreach/api.py"], hook_surface=False) == "critical", (
+        "a REAL api module must be unaffected, or the exemption is too wide"
+    )
+    assert _rs.classify_lane(
+        ["src/genesis/eval/gauntlet_fixtures_live/api.py"], hook_surface=False
+    ) == "critical", "a continuation of the prefix must NOT inherit the exemption"
 
 
 def test_the_explicit_rules_FULLY_EXPLAIN_the_critical_set():

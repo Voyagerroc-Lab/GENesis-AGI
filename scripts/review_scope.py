@@ -773,6 +773,29 @@ _LANE_PROSE_STEMS = frozenset(
 _LANE_PROSE_STEM_EXTS = _LANE_PROSE_EXTS | {".txt", ""}
 
 
+#: Fixture CORPORA — checked-in sample programs the eval harness loads as DATA.
+#: They read like source (`calc/api.py`, `statslib/core.py`) and are not: nothing
+#: here runs in production, and `gauntlet.py` loads the tree wholesale.
+#:
+#: ANCHORED as a directory prefix, never a substring or a `*fixture*` glob. A
+#: substring carve-out would exempt every continuation — `fixtures_live/`,
+#: `my_fixtures.py` — and this is the one rule in the lane that makes a change
+#: LIGHTER, so a loose spelling here is the only way this file can widen a budget
+#: by accident.
+#:
+#: MEASURED: 19 tracked files under this root reached standard (15), critical (1)
+#: and light (3). The CRITICAL one was `calc_longhorizon/calc/api.py`, pulled in by
+#: this module's OWN `api.py` basename rule — a sample program in the strictest
+#: lane, which is the same over-classification shape as the `*route*` glob, this
+#: time self-inflicted.
+_LANE_FIXTURE_ROOTS = ("src/genesis/eval/gauntlet_fixtures/",)
+
+
+def _is_lane_fixture_corpus(path: str) -> bool:
+    """Is *path* inside a declared fixture corpus? Prefix-anchored (see above)."""
+    return path.startswith(_LANE_FIXTURE_ROOTS)
+
+
 def _is_lane_critical_path(path: str) -> bool:
     """Is this path a consequence surface — somewhere it costs a lot to be wrong?
 
@@ -792,6 +815,8 @@ def _is_lane_critical_path(path: str) -> bool:
     same impulse and is gone for the same reason — config is ORDINARY, which is
     what the instruction files this change also edits already say.
     """
+    if _is_lane_fixture_corpus(path):
+        return False  # sample programs, not production surface
     if any(path.startswith(prefix) for prefix in _LANE_CRITICAL_PREFIXES):
         return True
     base = os.path.basename(path)
@@ -804,6 +829,8 @@ def _is_lane_critical_path(path: str) -> bool:
 
 def _is_lane_light(path: str) -> bool:
     """Prose, tests and fixtures — the material a wider finding budget suits."""
+    if _is_lane_fixture_corpus(path):
+        return True
     if _category(path) in ("test", "fixture"):
         return True
     base = os.path.basename(path)
