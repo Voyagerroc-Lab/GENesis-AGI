@@ -25,6 +25,7 @@ _REVIEW_STATE = _REPO_ROOT / "scripts" / "review_state.py"
 
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "hooks"))
+import review_scope  # noqa: E402
 import review_state  # noqa: E402
 
 
@@ -56,6 +57,64 @@ def home(tmp_path: Path) -> Path:
 def _stage(repo: Path, content: str) -> None:
     (repo / "f.py").write_text(content)
     _git(repo, "add", "-A")
+
+
+def test_the_shared_review_state_name_is_not_hijacked():
+    """The premise every `monkeypatch.setattr(review_state, ...)` here rests on.
+
+    `review_enforcement_commit` imports `review_state` at CALL time, so a patch
+    applied in this file only reaches production code if this module's
+    `review_state` and `sys.modules["review_state"]` are the SAME object.
+
+    Other test modules load a private copy of that script under the shared name.
+    pytest imports every test module at COLLECTION, so the last registration
+    wins for the whole session: a module collected earlier keeps a reference to
+    the object it bound, while production resolves whatever is in `sys.modules`
+    now. The patch then lands on nobody and the real function runs — a failure
+    invisible in a single-file run and visible only in the full suite, in
+    collection order.
+
+    Asserting the premise directly means the next unrestored hijack fails HERE,
+    naming the cause, instead of surfacing as a bewildering assertion in an
+    unrelated test. `tests.conftest.private_module` is the supported way to load
+    a private copy without leaking the name.
+    """
+    assert sys.modules.get("review_state") is review_state, (
+        "sys.modules['review_state'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it, so monkeypatching this module patches nothing that "
+        "production code will resolve. Load it via tests.conftest.private_module."
+    )
+
+
+def test_the_shared_review_scope_name_is_not_hijacked():
+    """The sibling lock, for the second name the commit gate imports at call time.
+
+    `review_scope` is resolved by a call-time import in five places, including
+    `review_enforcement_commit.classify_change_substantiality`, so the premise is
+    the same one the `review_state` lock above rests on: a patch applied to the
+    object THIS file holds only reaches production if it is the object
+    `sys.modules` hands the call-time import.
+
+    This file binds `review_scope` at module scope purely so that identity exists
+    to compare against — a canonical importer has to come from somewhere, and an
+    earlier revision of this lock concluded from its absence that PATH equality
+    was the best available check. It is not: two distinct module objects loaded
+    from the SAME path compare equal by path and differ by identity, so a private
+    copy left registered would pass a path assert while a `monkeypatch.setattr`
+    on the canonical object reached nobody. That is the exact divergence this
+    file exists to catch, and it is not hypothetical here —
+    `tests/test_scripts/test_check_review_depth.py` patches
+    `review_scope.classify_range_substantiality` against a call-time import at
+    `scripts/check_review_depth.py:60`.
+    """
+    assert sys.modules.get("review_scope") is review_scope, (
+        "sys.modules['review_scope'] is not the module this file imported — "
+        "some test module loaded a private copy under the shared name and did "
+        "not restore it. Same path is NOT sufficient: a same-path copy is a "
+        "different object, so patches land on one and production resolves the "
+        "other. Load it via tests.conftest.private_module."
+    )
 
 
 # ── Counter unit tests (review_state) ─────────────────────────────────────

@@ -1916,7 +1916,33 @@ verified: 788dd9a9 2026-09-06
   Surfaces: `zero_drop_status` (read-only, in the reflection allowlist —
   findings + counts + the detector's own freshness, because a stale board's
   zero is unverified rather than clean) and `zero_drop_ack(class_, branch,
-  reason)`. The ack is the ONLY suppression path by design — there are no
+  reason)`.
+  **The ACCOUNTING VIEW widens that answer past git without a second store**:
+  `session_awareness/zero_drop_view.py::build_view` DERIVES five parts on
+  demand — gaps (delegated whole to `_impl_zero_drop_status`, so the
+  neutralisation rules cannot drift), the open-PR pipeline (repo-pulse cache,
+  its `computed_at` age ALWAYS rendered and its count WITHHELD past the TTL —
+  a dead worker's snapshot presented as a number is the same false-clean one
+  layer out), store counts (stranded work, ledger, follow-ups), owner-pending,
+  and a roadmap naming what the board does NOT cover. Every count carries its
+  denominator, each part degrades INDEPENDENTLY (an unreadable store cannot
+  blank the readable ones), and a source past its freshness bound — or one that
+  cannot say WHICH repository it counted — WITHHOLDS its count rather than
+  rendering an unattributable or stale one; the same false-clean rule the
+  detector applies to itself, one layer out. Every figure describing one store
+  comes from ONE read of it, so two sections of a board cannot disagree about
+  the same population (`follow_ups.get_lane_counts` returns per-status
+  actionable counts and the deferred remainder together; the remainder is a
+  COMPLEMENT, so a `kind` added later is absorbed rather than dropped). Both accounting surfaces
+  (`GET /api/genesis/zero-drop` + the Zero-Drop tab, and the morning report's
+  Ground-Truth line) call that one assembler so they cannot disagree; the
+  morning-report line is COUNTS ONLY, never a branch name, because that
+  section's freedom from redaction work is exactly what its integers-only
+  discipline buys. `session_charters.ledger_counts_all` is the first
+  cross-session ledger count anywhere — a SUPERSET of the population
+  `ledger_escalation` acts on, which filters further by provenance.
+
+  The ack is the ONLY suppression path by design — there are no
   prefix denylists — so it ships with the detector rather than after it.
   Levers: settings domain `zero_drop` (off|observe|alert, default OBSERVE;
   invalid degrades to observe, never a silent off — a dead detector answers
